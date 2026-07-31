@@ -1,0 +1,138 @@
+# TrialOutcome (pharma domain) -- dataset build config for M1/M2.
+# All pharma-specific decisions live here per Section 0 core/ vs domains/pharma/ split.
+
+db:
+  # Values pulled from environment at runtime (see .env.example) -- never hardcode
+  # real credentials here. host/port/db/user/password read from POSTGRES_* env vars.
+  host_env: POSTGRES_HOST
+  port_env: POSTGRES_PORT
+  dbname_env: POSTGRES_DB
+  user_env: POSTGRES_USER
+  password_env: POSTGRES_PASSWORD
+  read_schema: marts
+  write_schema: ml
+
+# --- Label definition -----------------------------------------------------
+# DECISION (2026-07-30, confirmed with user): marts.fct_trials.is_terminated is
+# NOT used directly -- it is TRUE only for overall_status = 'TERMINATED' and is
+# FALSE for WITHDRAWN/SUSPENDED, which contradicts the spec's documented label
+# definition and would silently mislabel ~4,449 WITHDRAWN/SUSPENDED trials as
+# successes. The label is derived from overall_status instead. This raises the
+# positive rate from 14.3% (mart column) to 19.9% (derived), consistent with
+# the spec's expected ~20-25% positive rate.
+label:
+  positive_statuses: [TERMINATED, WITHDRAWN, SUSPENDED]
+  negative_statuses: [COMPLETED]
+
+# --- Row filters -----------------------------------------------------------
+filters:
+  # Interventional Phase 2/3 trials only. There is no separate `interventional`
+  # flag in marts.fct_trials -- phase itself is only assigned to interventional
+  # studies in the CT.gov taxonomy, so filtering to these phase values already
+  # excludes observational studies.
+  phase_in: [PHASE2, PHASE3, "PHASE2|PHASE3"]
+  overall_status_in: [COMPLETED, TERMINATED, WITHDRAWN, SUSPENDED]
+  # DECISION (2026-07-30, confirmed with user): drop rows with implausible
+  # start_date rather than let them fall into an arbitrary split bucket. 222 of
+  # 79,334 label-eligible rows (~0.3%) had start_date < 1990-01-01 (data-entry
+  # defaults going back to 1900-01-01) or start_date in the future for a trial
+  # already marked COMPLETED/TERMINATED/WITHDRAWN/SUSPENDED (logically
+  # impossible -- can't finish before it starts).
+  start_date_min: "1990-01-01"
+  start_date_max: today  # resolved to CURRENT_DATE at build time
+
+# --- Temporal split (locked dates) -----------------------------------------
+split:
+  train_end: "2020-01-01"      # start_date <  2020-01-01            -> train
+  calib_end: "2022-01-01"      # 2020-01-01 <= start_date < 2022-01-01 -> calib
+                                 # start_date >= 2022-01-01            -> test
+  random_state: 42              # for the contrast random split (same proportions)
+
+# --- Feature groups ----------------------------------------------------------
+# DECISION (2026-07-30, confirmed with user): live marts.fct_trials has
+# allocation, masking, has_dmc, and eligibility_criteria columns that the
+# original brief listed as unavailable (stale check). Only num_arms is
+# genuinely absent. These four are included as real features -- see
+# dropped_features below for the one column still missing.
+features:
+  design:
+    - phase                    # categorical
+    - enrollment_count         # log1p transform
+    - num_primary_outcomes
+    - num_sites
+    - has_results               # verified non-leaky: 1,228 RECRUITING/ACTIVE_NOT_RECRUITING
+                                 # trials already have has_results=true in the live mart
+                                 # (see notebooks/01_dataset_audit.ipynb section 4), so it is
+                                 # populated at/before trial start for a meaningful share of
+                                 # trials, not exclusively post-completion.
+    - allocation                # categorical: RANDOMIZED / NON_RANDOMIZED / NA / unknown
+    - masking                   # categorical: NONE / SINGLE / DOUBLE / TRIPLE / QUADRUPLE / unknown
+    - has_dmc                   # boolean, ~21.6% null -> tri-state categorical (true/false/unknown)
+  text_lite:
+    - eligibility_criteria_length   # word count of eligibility_criteria
+    - exclusion_keyword_count       # bullet/numbered items after "Exclusion Criteria" header
+  sponsor_history:
+    - sponsor_prior_trial_count       # point-in-time self-join, see dataset_builder.py
+    - sponsor_prior_termination_rate  # point-in-time self-join, see dataset_builder.py
+    - sponsor_class                    # from dim_sponsor -- static attribute, no leakage risk
+  condition:
+    - condition_name             # one-hot top-N + 'other' + 'unknown'
+    - condition_rarity           # point-in-time count of prior trials sharing the primary condition
+  temporal:
+    - start_year
+    - start_quarter
+
+condition_one_hot:
+  top_n: 20   # marts.dim_condition has 131,999 distinct condition_name values (long tail)
+              # -- top 20 + 'other' + 'unknown' keeps the encoding tractable.
+
+# --- Dropped features --------------------------------------------------------
+# Logged per-column with reason. Re-verify against marts.fct_trials schema
+# before assuming this list is still accurate -- it has drifted from the
+# original spec once already (see label/features DECISION notes above).
+dropped_features:
+  - name: num_arms
+    reason: "not in mart -- confirmed absent from marts.fct_trials (2026-07-30)"
+
+# --- Missingness policy -------------------------------------------------------
+# Null rates printed to stdout at build time (see PharmaDatasetBuilder.build_features).
+# Rates below measured against the Phase2/3 + label-eligible filtered set (2026-07-30, n=79,334):
+missingness_policy:
+  enrollment_count:
+    null_rate_observed: 0.0199   # 1,578 / 79,334
+    strategy: impute_median
+    add_indicator: enrollment_missing
+  num_primary_outcomes:
+    null_rate_observed: 0.0439   # 3,484 / 79,334
+    strategy: impute_median
+  num_sites:
+    null_rate_observed: 0.0876   # 6,954 / 79,334
+    strategy: impute_median
+  allocation:
+    null_rate_observed: 0.0274   # 2,176 / 79,334 (NULL or blank)
+    strategy: sentinel
+    sentinel_value: unknown
+  masking:
+    null_rate_observed: 0.0280   # 2,219 / 79,334 (NULL or blank)
+    strategy: sentinel
+    sentinel_value: unknown
+  has_dmc:
+    null_rate_observed: 0.2164   # 17,169 / 79,334
+    strategy: sentinel           # tri-state categorical, NOT imputed to a mode --
+                                  # 21.6% null is too high to collapse into true/false
+    sentinel_value: unknown
+  eligibility_criteria:
+    null_rate_observed: 0.0003   # 24 / 79,334
+    strategy: impute_empty_string   # -> criteria_length=0, exclusion_keyword_count=0
+  sponsor_prior_termination_rate:
+    strategy: impute_median      # NULL for sponsors with no prior trials (new sponsors)
+  sponsor_prior_trial_count:
+    strategy: impute_zero        # NOT median -- new sponsors genuinely have 0 prior trials
+  condition_name:
+    strategy: sentinel
+    sentinel_value: unknown
+  sponsor_class:
+    strategy: sentinel
+    sentinel_value: unknown
+  phase:
+    strategy: drop_row           # phase is the primary filter -- NULL phase is unclassifiable

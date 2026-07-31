@@ -1,0 +1,8 @@
+# Business cost matrix for threshold selection (M3).
+# FN = model predicts COMPLETED, trial actually terminates/withdraws/suspends.
+# FP = model predicts termination, trial actually completes.
+# 5:1 is a pharma-risk judgment (a missed failure wastes far more sponsor/patient
+# resource than a false alarm) -- not a universal constant, stays out of core/.
+fn_cost: 5
+fp_cost: 1
+target_coverage: 0.90
