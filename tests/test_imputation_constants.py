@@ -9,7 +9,9 @@ argument passed to it.
 """
 
 from __future__ import annotations
+
 import os
+
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 os.environ.setdefault("POSTGRES_PORT", "5433")
 os.environ.setdefault("POSTGRES_DB", "pharmapulse")
@@ -144,3 +146,4 @@ def test_serving_still_uses_request_value_when_field_supplied():
     row = _row_from_trial_features(trial, b)
 
     assert row.iloc[0]["sponsor_prior_termination_rate"] == 0.02
+
