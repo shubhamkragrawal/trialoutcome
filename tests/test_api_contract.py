@@ -6,16 +6,15 @@ Requires the API to be running first: `make serve` (or a local uvicorn run),
 then `make test-api`.
 """
 
-import pytest
 import requests
 
 BASE_URL = "http://localhost:8000"
 
-# NOTE (deviation from the M5 prompt's literal sample, flagged in
+# NOTE (deviation from the M5 spec's literal sample, flagged in
 # decisions.md): `intervention_model` was dropped and `has_results` was
 # added -- see domains/pharma/serving/api.py's TrialFeatures docstring for
 # why (the trained model never used intervention_model; it was trained on
-# has_results, which the prompt's literal payload omitted).
+# has_results, which the spec's literal payload omitted).
 SAMPLE_FEATURES = {
     "phase": "PHASE3",
     "log_enrollment_count": 6.215,

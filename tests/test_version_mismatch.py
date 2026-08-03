@@ -53,7 +53,9 @@ def _register_fake_staging_run(client: MlflowClient) -> tuple[str, str]:
 
     versions = client.search_model_versions(f"name='{REGISTERED_MODEL_NAME}'")
     version = next(v.version for v in versions if v.run_id == run_id)
-    client.transition_model_version_stage(name=REGISTERED_MODEL_NAME, version=version, stage="Staging")
+    client.transition_model_version_stage(
+        name=REGISTERED_MODEL_NAME, version=version, stage="Staging"
+    )
     return run_id, version
 
 
@@ -85,10 +87,14 @@ def test_mismatched_feature_pipeline_version_is_flagged_and_logged(real_dev_stat
         assert "mismatch" in captured.out.lower()
 
         with builder.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT * FROM ml.retrain_log WHERE new_run_id = :run_id"),
-                {"run_id": run_id},
-            ).mappings().first()
+            row = (
+                conn.execute(
+                    text("SELECT * FROM ml.retrain_log WHERE new_run_id = :run_id"),
+                    {"run_id": run_id},
+                )
+                .mappings()
+                .first()
+            )
         assert row is not None
         assert row["version_mismatch"] is True
         assert row["promoted"] is False

@@ -9,8 +9,8 @@ MLflow store -- mirrors tests/test_api_contract.py's pattern of an
 integration test that needs already-built state, not a fast DB-free unit
 test (see tests/test_drift_base.py for that kind).
 
-PERTURBATION CHOICE (deviates from the M7 brief's literal suggestion -- see
-decisions.md's M7 entry): the brief suggested "multiply log_enrollment_count
+PERTURBATION CHOICE (deviates from the M7 requirements' literal suggestion -- see
+decisions.md's M7 entry): the requirements suggested "multiply log_enrollment_count
 by 3" as the synthetic perturbation. Empirically verified against the real
 ml.training_dataset this does NOT work: the real baseline is already 11/38
 features (28.9%) drifted, and log_enrollment_count's drift status doesn't
@@ -22,7 +22,7 @@ the 0.5 threshold. 22 of the 38 compared columns are the one-hot
 5% of each one's boolean values (a small, seeded perturbation, not a
 wholesale corruption) reliably crosses 0.5 (~63% in practice). This test
 perturbs both: log_enrollment_count x3 (kept for continuity with the
-brief's intent, verified non-load-bearing on its own) plus the condition
+requirements' intent, verified non-load-bearing on its own) plus the condition
 one-hot flip (the part that actually forces the breach).
 
 NLTK_DISABLE_IMPORT_SECURITY=1 is required to import evidently transitively
@@ -34,7 +34,6 @@ from __future__ import annotations
 import json
 
 import numpy as np
-import pandas as pd
 import pytest
 from mlflow.tracking import MlflowClient
 from sqlalchemy import text
@@ -63,10 +62,16 @@ def perturbed_test_split():
     engine = builder.engine
 
     with engine.connect() as conn:
-        original_rows = conn.execute(
-            text("SELECT nct_id, features FROM ml.training_dataset WHERE split = 'test'")
-        ).mappings().all()
-    assert original_rows, "ml.training_dataset has no 'test'-split rows -- build it first (make build-dataset)"
+        original_rows = (
+            conn.execute(
+                text("SELECT nct_id, features FROM ml.training_dataset WHERE split = 'test'")
+            )
+            .mappings()
+            .all()
+        )
+    assert original_rows, (
+        "ml.training_dataset has no 'test'-split rows -- build it first (make build-dataset)"
+    )
 
     rng = np.random.default_rng(SEED)
     with engine.begin() as conn:
@@ -75,9 +80,12 @@ def perturbed_test_split():
             if "log_enrollment_count" in features and features["log_enrollment_count"] is not None:
                 features["log_enrollment_count"] = features["log_enrollment_count"] * 3.0
             for key in features:
-                if key.startswith("condition_") and isinstance(features[key], bool):
-                    if rng.random() < CONDITION_FLIP_PROB:
-                        features[key] = not features[key]
+                if (
+                    key.startswith("condition_")
+                    and isinstance(features[key], bool)
+                    and rng.random() < CONDITION_FLIP_PROB
+                ):
+                    features[key] = not features[key]
             conn.execute(
                 text(
                     "UPDATE ml.training_dataset SET features = CAST(:features AS JSONB) "
@@ -123,10 +131,14 @@ def test_synthetic_drift_breach_triggers_staging_registration(real_dev_state, pe
         )
 
         with builder.engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT * FROM ml.retrain_log WHERE new_run_id = :run_id"),
-                {"run_id": result["new_run_id"]},
-            ).mappings().first()
+            row = (
+                conn.execute(
+                    text("SELECT * FROM ml.retrain_log WHERE new_run_id = :run_id"),
+                    {"run_id": result["new_run_id"]},
+                )
+                .mappings()
+                .first()
+            )
         assert row is not None
         assert row["promoted"] is False
     finally:

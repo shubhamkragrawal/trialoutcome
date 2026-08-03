@@ -28,10 +28,15 @@ either failing or vanishing silently.
 from __future__ import annotations
 
 import pytest
-from mlflow.tracking import MlflowClient
 from mlflow.exceptions import MlflowException
+from mlflow.tracking import MlflowClient
 
-from domains.pharma.monitoring.retrain_trigger import REGISTERED_MODEL_NAME, REPO_ROOT, _set_tracking_uri
+from domains.pharma.monitoring.retrain_trigger import (
+    REGISTERED_MODEL_NAME,
+    REPO_ROOT,
+    _set_tracking_uri,
+)
+
 
 def _has_real_dev_state() -> bool:
     """
@@ -68,6 +73,7 @@ def _has_real_dev_state() -> bool:
         has_production_model = False
     has_raw_cache = (REPO_ROOT / "data" / "raw_trials_cache.parquet").exists()
     return has_production_model and has_raw_cache
+
 
 @pytest.fixture
 def real_dev_state():

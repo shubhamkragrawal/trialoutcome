@@ -1,5 +1,5 @@
 """Integration test for M7's rollback procedure: demonstrates the exact M7
-DoD requirement -- promote a deliberately bad model to Production, verify
+acceptance criteria -- promote a deliberately bad model to Production, verify
 it's live, then roll back to the known-good version via
 rollback_production(). Requires the local file-backed MLflow store
 (mlruns/) with a real version already registered in stage "Production" --
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 from mlflow.tracking import MlflowClient
 from sklearn.dummy import DummyClassifier
 
@@ -41,9 +40,7 @@ def _register_and_promote_bad_model(client: MlflowClient) -> tuple[str, str, flo
 
     X_eval = pd.DataFrame({"x": rng.normal(size=200)})
     y_eval = pd.Series(rng.integers(0, 2, size=200))
-    bad_pr_auc = float(
-        average_precision_score(y_eval, bad_model.predict_proba(X_eval)[:, 1])
-    )
+    bad_pr_auc = float(average_precision_score(y_eval, bad_model.predict_proba(X_eval)[:, 1]))
 
     with mlflow.start_run(run_name="test_bad_promotion_simulated") as run:
         mlflow.set_tag("run_type", "test_bad_promotion")
@@ -56,7 +53,10 @@ def _register_and_promote_bad_model(client: MlflowClient) -> tuple[str, str, flo
     versions = client.search_model_versions(f"name='{REGISTERED_MODEL_NAME}'")
     bad_version = next(v.version for v in versions if v.run_id == run_id)
     client.transition_model_version_stage(
-        name=REGISTERED_MODEL_NAME, version=bad_version, stage="Production", archive_existing_versions=True
+        name=REGISTERED_MODEL_NAME,
+        version=bad_version,
+        stage="Production",
+        archive_existing_versions=True,
     )
     return run_id, bad_version, bad_pr_auc
 
