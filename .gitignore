@@ -19,3 +19,4 @@ claude.md
 # CI uploads these as workflow artifacts instead of committing them).
 reports/*.html
 logs/
+final_review.md
