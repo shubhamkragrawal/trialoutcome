@@ -1,0 +1,25 @@
+# Requires metrics-server for the CPU utilization metric. NOTE (corrects the
+# M8 prompt's assumption): k3d 5.9.0 / k3s v1.35.5 ships metrics-server
+# bundled by default (verified via `kubectl get deployment metrics-server -n
+# kube-system` immediately after `k3d cluster create`, no separate install
+# step needed) -- this may not hold for every k3d/k3s version, so still
+# verify on a fresh cluster before assuming it's there (see
+# docs/k8s_setup.md).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trialoutcome-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trialoutcome-api
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
