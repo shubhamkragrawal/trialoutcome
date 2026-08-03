@@ -57,7 +57,7 @@ split:
 features:
   design:
     - phase                    # categorical
-    - enrollment_count         # log1p transform
+    # enrollment_count REMOVED in M9 -- target leakage, see dropped_features.
     - num_primary_outcomes
     - num_sites
     - has_results               # verified non-leaky: 1,228 RECRUITING/ACTIVE_NOT_RECRUITING
@@ -93,15 +93,42 @@ condition_one_hot:
 dropped_features:
   - name: num_arms
     reason: "not in mart -- confirmed absent from marts.fct_trials (2026-07-30)"
+  # --- M9-1 (2026-08-03) ------------------------------------------------------
+  # Target leakage. WITHDRAWN means "stopped before enrolling the first
+  # participant," so actual enrollment is 0 BY DEFINITION of the label class:
+  # P(label=1 | enrollment_count == 0) = 0.981 overall and 1.000 on TEST, and
+  # 3,994/3,994 WITHDRAWN trials with enrollment_type='ACTUAL' have
+  # enrollment_count = 0. A single `if enrollment == 0` rule scores 0.632
+  # PR-AUC on TEST -- within 0.017 of the whole pipeline minus enrollment.
+  # Ablation: full 0.888 -> without enrollment 0.648 (~40% of total lift over
+  # the 0.317 baseline came from a column encoding the label).
+  - name: enrollment_count
+    reason: >-
+      target leakage -- WITHDRAWN is definitionally a zero-enrollment status,
+      so the feature encodes the label class. Removed in M9 along with its
+      log1p transform and missingness indicator. See review section 1.1 and
+      decisions.md M9-1.
+  - name: log_enrollment_count
+    reason: "derived from enrollment_count -- removed with it in M9 (see above)"
+  - name: enrollment_missing
+    reason: >-
+      missingness indicator for enrollment_count. Removed in M9 not merely as
+      a dependent of the dropped column but on its own evidence: under the
+      review's fix path A (keep enrollment only where enrollment_type =
+      'ESTIMATED') this indicator becomes a proxy for enrollment_type !=
+      'ESTIMATED', which is itself post-hoc -- every trial's enrollment record
+      reads ESTIMATED at registration and only becomes ACTUAL once the trial
+      reports. Measured: the indicator ALONE, carrying no enrollment magnitude,
+      supplies +0.0288 of path A's +0.0337 PR-AUC lift over path B. See
+      decisions.md M9-1 for the decomposition table.
 
 # --- Missingness policy -------------------------------------------------------
 # Null rates printed to stdout at build time (see PharmaDatasetBuilder.build_features).
 # Rates below measured against the Phase2/3 + label-eligible filtered set (2026-07-30, n=79,334):
 missingness_policy:
-  enrollment_count:
-    null_rate_observed: 0.0199   # 1,578 / 79,334
-    strategy: impute_median
-    add_indicator: enrollment_missing
+  # enrollment_count's policy (impute_median + enrollment_missing indicator)
+  # was removed in M9 -- the column is no longer a feature. See
+  # dropped_features above.
   num_primary_outcomes:
     null_rate_observed: 0.0439   # 3,484 / 79,334
     strategy: impute_median
@@ -137,22 +164,51 @@ missingness_policy:
   phase:
     strategy: drop_row           # phase is the primary filter -- NULL phase is unclassifiable
 
-# --- M3 threshold decision --------------------------------------------------
-# DECISION (2026-07-30, confirmed with user): cost-optimal threshold, chosen by
-# sweeping domains/pharma/cost_matrix.yaml's 5:1 FN:FP cost ratio against the
-# TEST split's ISOTONIC-CALIBRATED probabilities (calibrator fit on CALIB per
-# notebooks/03_calibration.ipynb, chosen over Platt scaling by lower ECE:
-# 0.0000 vs 0.0405 on CALIB, confirmed 0.0238 vs raw 0.1897 on held-out TEST).
-# Not written by the notebook itself -- computed there, then added here by
-# hand, to avoid a machine-written yaml.safe_dump stripping this file's
-# hand-authored comments.
+# --- M3 threshold decision (SUPERSEDED BY M9 -- see below) -------------------
+# The original M3 value (0.22) was selected by sweeping the 5:1 FN:FP cost
+# ratio against the TEST split and then reporting metrics at that same
+# threshold on TEST. The M9 review (section 1.2) correctly identified this as a
+# one-parameter fit on the evaluation split, not a "reporting step." Superseded
+# below. Kept as a comment for provenance, not as a live value.
+#
+# --- M9 threshold decision ---------------------------------------------------
+# DECISION (M9-4, 2026-08-03): SELECTED ON CALIB (n=6,310), REPORTED ON TEST
+# (n=5,700). Swept against domains/pharma/cost_matrix.yaml's 5:1 FN:FP ratio
+# using the M9 no-enrollment model's isotonic-calibrated probabilities.
+#
+# INSTABILITY FLAG -- READ BEFORE TRUSTING THIS NUMBER. The M9 fix plan said
+# that if the CALIB- and TEST-selected thresholds differ by more than ~0.05,
+# the operating point is unstable and needs a bootstrap CI rather than a point
+# estimate. They differ by 0.08 (CALIB 0.14 vs TEST 0.22), so that contingency
+# fired and the bootstrap was run:
+#   * 1,000-resample bootstrap of the CALIB selection: 95% CI = [0.10, 0.20],
+#     median 0.14. The interval is 0.10 wide -- half the useful range.
+#   * The cost surface is nearly flat across it: on TEST, cost at 0.14 is 3,130
+#     vs 3,019 at the TEST-optimal 0.22 -- 3.7% regret for doing this honestly.
+#   * That 3.7% IS the bias the old TEST-selected 0.22 was hiding.
+# The point estimate is therefore reported WITH its interval everywhere. A real
+# deployment would pick the operating point from the CI plus a capacity
+# constraint (how many trials can review actually absorb), not from argmin
+# alone.
+#
+# OPERATIONAL CAVEAT: at 0.14 the model flags 70.5% of trials that actually
+# complete. That is what a 5:1 FN:FP matrix asks for once the leaked feature is
+# gone and the model is genuinely weaker -- it is a triage filter, not an
+# automated decision gate. Named here rather than buried.
 model:
   threshold_decision:
-    value: 0.22
-    method: cost_optimal      # vs f1_max=0.37 (cost 2508) and default=0.5 (cost 3081)
-    expected_cost_at_threshold: 2044.0   # FN_count*5 + FP_count*1, TEST split (n=5700)
-    recall_at_threshold: 0.880   # catches 88.0% of trials that actually terminate
-    fp_rate_at_threshold: 0.246  # 24.6% false-positive rate among trials that actually complete
+    value: 0.14
+    method: cost_optimal
+    selected_on: calib          # M9-4: the fit split
+    reported_on: test           # M9-4: the evaluation split
+    bootstrap_ci_95: [0.10, 0.20]   # 1,000 resamples of the CALIB selection
+    test_would_have_selected: 0.22  # reference only -- NOT used, this is the biased choice
+    regret_vs_test_optimal_pct: 3.7
+    expected_cost_at_threshold: 3130.0   # FN_count*5 + FP_count*1, TEST split (n=5700)
+    recall_at_threshold: 0.957   # catches 95.7% of trials that actually terminate
+    fp_rate_at_threshold: 0.705  # 70.5% false-positive rate among trials that actually complete
+    precision_at_threshold: 0.386
+    f1_at_threshold: 0.550
     calibration_method: isotonic
     computed_in: notebooks/03_calibration.ipynb
 

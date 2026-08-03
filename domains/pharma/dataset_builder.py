@@ -10,7 +10,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
@@ -194,7 +193,10 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         and writes the result to ml.training_dataset.
     Leakage guard: Owns every point-in-time join (sponsor history, condition
         rarity) and the label definition, so leakage-sensitive logic lives in
-        exactly one place.
+        exactly one place. M9-1: also owns the decision to exclude
+        enrollment_count -- the point-in-time joins guard row placement, but
+        feature *semantics* ("is this value knowable at start_date?") is a
+        separate question this class is the only place to answer.
     Failure mode: N/A (class-level).
     """
 
@@ -239,16 +241,19 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
 
     def build_features(self, raw: pd.DataFrame) -> pd.DataFrame:
         """
-        Purpose: Turn raw fetch_raw() rows into model-ready features: log1p
-            enrollment, temporal parts, text-lite eligibility features,
-            missingness imputation/sentinels per config.yaml's
-            missingness_policy. Leaves condition_name as a raw categorical --
-            one-hot encoding happens after temporal_split so the top-N
-            vocabulary is fit on the train split only (see _one_hot_condition).
-        Leakage guard: Null-rate printing (stdout) and the enrollment_missing
-            indicator make imputation decisions visible/auditable rather than
-            silently smoothing over missingness that might itself be
-            informative (e.g. a trial too new to have a site count yet).
+        Purpose: Turn raw fetch_raw() rows into model-ready features: temporal
+            parts, text-lite eligibility features, missingness
+            imputation/sentinels per config.yaml's missingness_policy. Leaves
+            condition_name as a raw categorical -- one-hot encoding happens
+            after temporal_split so the top-N vocabulary is fit on the train
+            split only (see _one_hot_condition).
+        Leakage guard: Null-rate printing (stdout) makes imputation decisions
+            visible/auditable rather than silently smoothing over missingness
+            that might itself be informative (e.g. a trial too new to have a
+            site count yet). M9-1: enrollment_count is deliberately NOT
+            engineered here -- a missingness indicator on it encoded
+            post-hoc record state, which is why the M9 review's fix path A
+            was rejected on evidence.
         Failure mode: If the missingness policy here drifts from
             config.yaml's documented policy, the config file becomes
             misleading documentation instead of a source of truth.
@@ -278,9 +283,13 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         df = df.dropna(subset=["phase"])
 
         # --- Design group -----------------------------------------------
-        df["enrollment_missing"] = df["enrollment_count"].isna().astype(int)
-        df["enrollment_count"] = df["enrollment_count"].fillna(df["enrollment_count"].median())
-        df["log_enrollment_count"] = np.log1p(df["enrollment_count"])
+        # M9-1: enrollment_count is NOT engineered into a feature any more --
+        # it is target leakage (see the class docstring and config.yaml's
+        # dropped_features). The raw column is still fetched and carried
+        # through so notebooks/01_dataset_audit.ipynb and docs/error_analysis.md
+        # can show the leak, but nothing downstream of feature_columns() sees
+        # it. Do not re-derive log_enrollment_count/enrollment_missing here
+        # without reading decisions.md M9-1 first.
         df["num_primary_outcomes"] = df["num_primary_outcomes"].fillna(
             df["num_primary_outcomes"].median()
         )
@@ -357,8 +366,6 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         """
         return [
             "phase",
-            "log_enrollment_count",
-            "enrollment_missing",
             "num_primary_outcomes",
             "num_sites",
             "has_results",

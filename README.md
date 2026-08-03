@@ -19,29 +19,86 @@ log: [`decisions.md`](decisions.md); spec with per-milestone Definition of Done:
 
 ## Headline numbers
 
-| Metric | Value |
-|---|---|
-| PR-AUC, temporal test (XGBoost, CV-selected, uncalibrated) | **0.8878** |
-| PR-AUC, temporal test (same model, after isotonic calibration) | 0.8775 |
-| PR-AUC, random split (same features/model — leakage contrast, see below) | 0.6823 |
-| ROC-AUC, temporal test (calibrated production model) | 0.9178 |
-| ECE, after isotonic calibration (TEST) | **0.0238** (raw: 0.1897) |
-| Conformal coverage (target 90%) | **94.6%** |
-| Cost-optimal threshold (5:1 FN:FP cost matrix) | **0.22** |
-| Majority-class baseline PR-AUC (temporal test) | 0.3167 |
+**Updated in M9 — read this before the table.** `enrollment_count` was found to be target
+leakage (`WITHDRAWN` is definitionally zero-enrollment; `P(label=1 | enrollment==0) = 1.000`
+on TEST). It was removed, the champion was retrained, and every number below moved. The
+leaked numbers are kept in the table for comparison, not as the honest result — see
+["The enrollment leakage" below](#the-enrollment-leakage--interviewers-will-read-this-first)
+for the full investigation, including the fix that *looked* right and turned out to leak too.
 
-Calibration and calibrated-model PR-AUC differ slightly (0.8878 vs 0.8775) because isotonic
+| Metric | Pre-M9 (leaked) | M9 (honest) |
+|---|---|---|
+| PR-AUC, temporal test (XGBoost, uncalibrated) | 0.8878 | **0.6484** |
+| PR-AUC, temporal test (after isotonic calibration) | 0.8775 | 0.6309 |
+| ROC-AUC, temporal test (calibrated production model) | 0.9178 | **0.7862** |
+| ECE, after isotonic calibration (TEST) | 0.0238 (raw: 0.1897) | **0.0319** (raw: 0.2734) |
+| Conformal coverage (target 90%) | 94.6% | **93.5%** |
+| Cost-optimal threshold (5:1 FN:FP cost matrix) | 0.22 (selected on TEST — see M9-4) | **0.14** (selected on CALIB, 95% bootstrap CI [0.10, 0.20]) |
+| Majority-class baseline PR-AUC (temporal test) | 0.3167 | 0.3167 |
+
+Calibration and calibrated-model PR-AUC differ slightly within each column because isotonic
 regression is a monotonic but non-linear remapping of scores, which can shuffle tie-breaks
-near the decision boundary — the calibrated number is what the Production model and this
-README's other calibration/conformal/threshold numbers all use.
+near the decision boundary — the calibrated M9 number (0.6309) is what the Production model
+and this README's other calibration/conformal/threshold numbers all use. Production model:
+MLflow registry version **16**.
 
-## The leakage experiment ← interviewers will read this
+## The enrollment leakage ← interviewers will read this first
+
+`enrollment_count` — the model's #1 feature pre-M9, contributing 4.4× the SHAP magnitude of
+whatever ranked second — was target leakage. `WITHDRAWN` means "stopped before enrolling the
+first participant," so actual enrollment is 0 *by definition of the label class*:
+`P(label=1 | enrollment_count == 0) = 1.000` on TEST (n=5,700). A one-line
+`if enrollment == 0` rule alone scores 0.632 PR-AUC — within 0.017 of the entire pipeline
+minus enrollment. Removing it dropped TEST PR-AUC from 0.888 to 0.648, meaning **~40% of the
+model's entire lift over the 0.317 majority baseline came from a column reading off the
+label.**
+
+**The leakage-detection framework built in M1/M2 (temporal-vs-random split, controlled
+fixed-window ablation) tested for this and returned a genuine true negative** — there is no
+temporal row-placement leakage anywhere in this feature set (see "Temporal vs. random split"
+below, unchanged and still valid). It structurally could not catch this leak, because every
+check in it asks "which rows went where," and this leak lives in "is this value knowable at
+`start_date`?" — a different question the framework was never built to ask.
+
+**The fix that looked obviously right also leaked, and only an ablation caught it.**
+ClinicalTrials.gov's `enrollmentInfo.type` field (`ACTUAL`/`ESTIMATED`) distinguishes planned
+enrollment from post-hoc actual enrollment. Keeping only `ESTIMATED`-typed values (nulling
+the rest) is the textbook fix, and it scored 0.682 PR-AUC — 0.034 better than dropping
+enrollment outright. That +0.034 looked like free signal. Decomposing it wasn't free:
+
+| Variant | TEST PR-AUC | Lift over dropping enrollment entirely |
+|---|---|---|
+| value + missingness indicator | 0.6821 | +0.0337 |
+| **indicator only — zero enrollment magnitude** | **0.6772** | **+0.0288 (85% of the total)** |
+| value only, no indicator | 0.6656 | +0.0172 |
+| enrollment dropped entirely | 0.6484 | — |
+
+A bare bit carrying **no enrollment magnitude at all** supplied 85% of the "fix's" advantage.
+The reason: under this fix, the missingness indicator no longer means "enrollment unknown" —
+it means `enrollment_type != 'ESTIMATED'`, and every trial's record reads `ESTIMATED` at
+registration, flipping to `ACTUAL` only once the trial reports. The "fix" swapped one
+definitional leak for a subtler record-maintenance one. Enrollment was dropped entirely
+instead. Full investigation, including why a registration-time-snapshot API (not currently
+available from this warehouse) is the only thing that would legitimately bring it back:
+`decisions.md` M9-1.
+
+## Temporal vs. random split ← a different leakage question, still worth reading
+
+Distinct from the enrollment leakage above: this experiment tests *row-placement* leakage
+(does a random train/test split let future information leak backward?), not feature
+semantics. **Correction:** this notebook's LogReg pipeline also had `log_enrollment_count`
+in its own hardcoded feature list (separate from `train_pipeline.py`'s), so it was NOT
+unaffected by the M9 fix as first assumed here — it was re-executed on the no-enrollment
+feature set along with everything else, and every number below moved. **The qualitative
+finding is unchanged**, which is the part that actually matters: dropping enrollment
+changes what the row-placement test measures the model *with*, not what row-placement
+leakage does to it.
 
 Trained the identical `LogisticRegression` pipeline (same features, same hyperparameters)
 under two split strategies:
 
-- **Temporal split** (train < 2020, calib 2020–2022, test ≥ 2022): PR-AUC **0.8657**
-- **Random split** (60/20/20 shuffle, same proportions): PR-AUC **0.6823**
+- **Temporal split** (train < 2020, calib 2020–2022, test ≥ 2022): PR-AUC **0.5676**
+- **Random split** (60/20/20 shuffle, same proportions): PR-AUC **0.3687**
 
 The temporal split scores *higher*, not lower — the opposite of the naive "random split
 leaks future sponsor history and inflates performance" story this experiment was designed
@@ -59,15 +116,23 @@ to test for. Two confounds explain the gap, and neither is leakage:
 A **controlled ablation** isolates the actual leakage mechanism directly: fix one test
 window (2020–2022), and compare a same-size "honest" training set (only rows strictly
 before the window) against a "leaky" one (allowed to include rows *after* the window). If
-random-split leakage were real, the leaky model should win. It doesn't — across all three
-model families checked (LogReg, XGBoost, LightGBM), the honest/leaky PR-AUC delta is
-**≤0.002**, noise-level:
+random-split leakage were real, the leaky model should win handily. Re-run on the M9
+no-enrollment feature set with the same previously-logged best hyperparameters (no fresh
+Optuna sweep):
 
 | Model | Honest PR-AUC | Leaky PR-AUC | Delta |
 |---|---|---|---|
-| LogReg | 0.785 | 0.786 | +0.0006 |
-| XGBoost | 0.8031 | 0.8042 | +0.0011 |
-| LightGBM | 0.8033 | 0.8049 | +0.0016 |
+| LogReg | 0.4568 | 0.4558 | −0.0009 |
+| XGBoost | 0.5338 | 0.5472 | +0.0134 |
+| LightGBM | 0.5583 | 0.5672 | +0.0089 |
+
+**Honest note on this table:** pre-M9 the tree-model deltas were ≤0.002 (noise-level on a
+~0.80 PR-AUC base). Post-M9 they're 0.009–0.013 — small in absolute terms, but a larger
+share of a smaller base (~1.6–2.5% relative, vs ~0.15% before). That's not strong evidence
+of a temporal leak reappearing — LogReg, the model class this notebook's narrative
+otherwise centers, still shows a near-zero and *negative* delta — but a weaker model
+naturally has a wider noise band around a small effect, and 0.013 is close enough to worth
+having in the record rather than silently kept at the old, now-false "≤0.002" figure.
 
 **Why it matters:** this is a property of *this specific feature set* — every feature
 (sponsor history, condition rarity) is computed via a point-in-time self-join
@@ -80,10 +145,10 @@ exactly how you'd catch it. The temporal split stays mandatory regardless of thi
 result. Full writeup: `notebooks/02_leakage_demo.ipynb`, `decisions.md`'s M1/M2 entries.
 
 **Documentation note:** `ai_portfolio/02_TRIALOUTCOME_SPEC.md`'s M1 milestone row states the
-random-split PR-AUC as "0.891" — that figure doesn't match either `decisions.md`'s M1
-finding or `notebooks/02_leakage_demo.ipynb`'s actual executed output (0.6823), both of which
-agree with each other. Flagged here rather than silently reconciled; the notebook's number is
-the one used throughout this README since it's the directly-executed artifact.
+random-split PR-AUC as "0.891" — that figure doesn't match either the pre-M9 or the current
+M9 `notebooks/02_leakage_demo.ipynb` executed output. Flagged here rather than silently
+reconciled; the notebook's directly-executed number (0.3687, post-M9) is the one used
+throughout this README.
 
 ## Try it
 
@@ -93,7 +158,6 @@ curl -X POST localhost:8000/api/v1/predict \
   -H "Content-Type: application/json" \
   -d '{
         "phase": "PHASE3",
-        "log_enrollment_count": 6.215,
         "num_primary_outcomes": 2,
         "num_sites": 45,
         "has_dmc": true,
@@ -118,15 +182,23 @@ Both return the locked cross-project contract shape:
 `{proba, conformal_interval, threshold_decision, top_shap, plain_english_summary, feature_pipeline_version}`
 — this exact shape is what RegIntel's `trial_risk` tool wrapper (Project 4) is built against.
 
+**M9 note:** the request body's `log_enrollment_count` field is now accepted but ignored
+(`enrollment_count` was dropped as target leakage — see above); it is omitted from the
+example on purpose. It is kept as an optional no-op in the schema, not deleted, so it doesn't
+break RegIntel's wrapper until both sides coordinate a contract update.
+
 ## Model decisions worth reading
 
-Full log: [`decisions.md`](decisions.md). Three entries an interviewer would find most
+Full log: [`decisions.md`](decisions.md). Four entries an interviewer would find most
 interesting:
 
-- **Cost-optimal threshold = 0.22, not F1-max (0.37) or default (0.5)** — chosen by
-  minimizing expected cost against the pharma domain's 5:1 FN:FP cost ratio, not by
-  optimizing a metric that treats a missed termination and a false alarm as equally costly.
-- **Conformal coverage 94.6% vs a 90% target** — MAPIE's LAC (least-ambiguous-set) conformal
+- **`enrollment_count` was target leakage; the obvious fix leaked too (M9-1).** See "The
+  enrollment leakage" above — the headline story in this repo.
+- **Cost-optimal threshold = 0.14, selected on CALIB and reported on TEST (M9-4)** — the
+  previous 0.22 was selected *and* reported on TEST, a one-parameter fit on the evaluation
+  split. CALIB and TEST disagreed by more than the ~0.05 stability margin, so a bootstrap CI
+  (95%: [0.10, 0.20]) ships alongside the point estimate rather than instead of it.
+- **Conformal coverage 93.5% vs a 90% target** — MAPIE's LAC (least-ambiguous-set) conformal
   score is finite-sample conservative at this calibration-set size; a comfortable pass, not a
   razor-thin one, with per-request interval widths that still vary meaningfully by predicted
   probability (`docs/conformal_width_vs_proba.png`).
@@ -138,27 +210,35 @@ interesting:
 
 ## Error analysis
 
-Full essay: [`docs/error_analysis.md`](docs/error_analysis.md). Three failure themes across
-the 20 worst false negatives (all share one precondition: `sponsor_prior_termination_rate <
-6%`):
+**Rewritten completely in M9** — the previous version analyzed a model dominated by a leaked
+feature; every trial, theme, and number below changed. Full essay:
+[`docs/error_analysis.md`](docs/error_analysis.md). With `enrollment_count` gone,
+`sponsor_prior_termination_rate` is now the #1 global SHAP feature (was #2, behind
+enrollment, at 4.4× less magnitude than the top feature — now the gap to #2 is 1.2×). Three
+failure themes across the 20 worst false negatives:
 
-1. **"Mega-sponsors"** (5/20) — a sponsor with hundreds of prior trials has a termination
-   rate averaged over enough history that one failing trial barely moves it.
-2. **Single/near-single-site trials** (9/20) — `num_sites` nudges risk up but stays modest;
-   the feature set has no direct site-execution-risk signal.
-3. **No individually extreme feature** (9/20) — **the honest feature ceiling.** These trials
-   have no outlier design, sponsor, or site profile in any feature group this project builds;
-   whatever drove termination (drug efficacy, funding withdrawal, protocol amendment) simply
-   isn't observed by any feature here. This is the current feature set's explanatory floor,
-   not a modeling bug.
+1. **A clean sponsor record dominates everything else** (14/20) — the direct, predictable
+   consequence of removing enrollment: the model is now substantially a sponsor-reputation
+   model, and a 0% historical termination rate says nothing about *this* trial's drug,
+   protocol, or funding decision. Not a bug — the honest ceiling of what removing the leak
+   leaves behind.
+2. **`has_results = True` at mega-sponsors overrides a mediocre sponsor record** (4/20) — the
+   only worst-20 rows whose sponsor rate isn't low; `has_results` (a reporting-behavior proxy
+   for "large, organized sponsor," verified non-leaky in M1) pushes hard enough toward
+   completion to override it.
+3. **Recency** (2/20) — `start_year` reflects data-recency mechanics (recent trials haven't
+   had time to reach a terminal status) as much as any real secular trend.
 
 ## Calibration
 
 Reliability curve (before vs after, isotonic vs Platt): `notebooks/03_calibration.ipynb`.
+Numbers below are for the M9 no-enrollment champion (registry v16).
 
-- ECE before calibration (raw XGBoost, TEST): **0.1897**
-- ECE after isotonic calibration (TEST): **0.0238**
-- ECE after Platt scaling (TEST, for comparison): 0.0405 (isotonic won)
+- ECE before calibration (raw XGBoost, TEST): **0.2734**
+- ECE after isotonic calibration (TEST): **0.0319**
+- ECE after Platt scaling (TEST, for comparison): 0.0331 (isotonic still wins, by a
+  narrower margin than pre-M9's 0.0238 vs 0.0405 — the weaker honest model leaves isotonic
+  less room to separate from Platt)
 
 Isotonic beat Platt because it makes no parametric shape assumption — it can correct
 whatever miscalibration pattern the raw XGBoost scores actually have, while Platt is
@@ -178,10 +258,13 @@ trials scored by the live API. No live scoring traffic exists yet, so the held-o
 split is used as a stand-in for "a batch the model hasn't seen" — this validates the
 monitoring *mechanism*, not a real production drift claim.
 
-**Latest run:** 11/38 features drifted (`drift_share=0.289`), below the
-`feature_drift_threshold=0.5` dataset-level alert — **not flagged**. The top-5 most-drifted
+**Latest run (M9, no-enrollment feature set, 36 features):** 10/36 features drifted
+(`drift_share=0.278`), below the `feature_drift_threshold=0.5` dataset-level alert — **not
+flagged**. (Pre-M9: 31/38, `drift_share=0.816` — flagged. Two fewer total features and a
+smaller drifted count both follow mechanically from dropping `enrollment_count` and
+`enrollment_missing`; not independently re-derived here, just noted.) The top-5 most-drifted
 features are `start_year`, `condition_rarity`, `sponsor_prior_trial_count`,
-`eligibility_criteria_length`, and `log_enrollment_count` — every one is either a temporal
+`eligibility_criteria_length`, and `exclusion_keyword_count` — every one is either a temporal
 feature (drifted by construction: train is entirely pre-2020, test is entirely 2022+), a
 cumulative point-in-time count that mechanically grows over calendar time, or a real secular
 trend in trial design over 30+ years. None of this is surprising; it's exactly what you'd
@@ -287,18 +370,23 @@ Honest gaps in this demo, not hidden:
 
 ## What I'd build next
 
-Concrete items from the error analysis, ranked by what they'd actually fix:
+Concrete items from the M9 error analysis, ranked by what they'd actually fix:
 
-1. **Recency-weighted sponsor history** (Theme 1 fix) — a lookback window that weights a
-   sponsor's recent trials more than trials from a decade ago would better reflect a large
-   sponsor's *current* risk profile than a flat lifetime average.
-2. **Site-execution-risk signal** (Theme 2 fix) — `num_sites` alone can't distinguish a
-   well-funded single-site trial from a fragile one; a real execution-risk feature (site
-   experience, funding source) would.
-3. **Drug-mechanism/efficacy features** (Theme 3 — the genuine ceiling raiser) — nearly half
-   the worst misses have no standout feature in any group this project builds; closing that
-   gap needs genuinely new information (safety signal, protocol-amendment history), not more
-   tuning of the existing feature set.
+1. **Point-in-time sponsor-history fix (M9 P1-11)** — sponsor history currently uses each
+   prior trial's *final* label rather than its status as of this trial's `start_date`. This
+   was a known inherited limitation since M1; it's materially more important now that
+   `sponsor_prior_termination_rate` is the model's #1 feature (Theme 1, 14/20 worst misses)
+   rather than its #2 behind a leaked column.
+2. **Registration-time enrollment, if it ever becomes available** — the only thing that would
+   legitimately bring enrollment back as a feature is a versioned-record/history API exposing
+   the *planned* figure as of registration. Not available from the current warehouse; see "The
+   enrollment leakage" above.
+3. **Site-execution-risk signal** (Theme 2, `has_results`-at-mega-sponsors) — a real
+   execution-risk feature (site experience, funding source) would help distinguish "reports
+   results because well-resourced" from "reports results because low-risk."
+4. **Drug-mechanism/efficacy features** — closing the honest ceiling on Theme 1 needs
+   genuinely new information (safety signal, protocol-amendment history), not more tuning of
+   the existing feature set.
 4. **Remote MLflow artifact store** (infrastructure, flagged in M5's `decisions.md`) — the
    current local-file-backed `mlruns/` bakes absolute host paths into run metadata and only
    works because `docker-compose.yml` bind-mounts it at an identical path — a real deployment
@@ -308,14 +396,22 @@ Concrete items from the error analysis, ranked by what they'd actually fix:
 
 Full list with context: `docs/error_analysis.md`'s "Known Limitations" section. In brief:
 
+- **`enrollment_count` was target leakage and is gone (M9)** — see "The enrollment
+  leakage" above. The headline honest-model number (0.648 PR-AUC) reflects its absence.
 - `num_arms` isn't available in the PharmaPulse mart; excluded entirely.
 - `therapeutic_area` is NULL for every row in `dim_condition` — `condition_name` is used as a
   coarser proxy throughout.
 - Sponsor-history features use each prior trial's `start_date`, not its outcome-resolution
   date, so a still-running prior trial counts as "not terminated" even though its true
   outcome is unknown at that point — an inherited limitation from the spec's own example
-  logic, not a new bug.
+  logic, not a new bug, but now materially more important since `sponsor_prior_termination_rate`
+  is the model's #1 feature rather than its #2 behind a leaked column.
+- **The 0.14 operating threshold ships with a bootstrap interval, not just a point estimate
+  (M9)** — CALIB and TEST cost-optimal selection disagreed by 0.08, above the ~0.05 stability
+  margin; the 95% CI is [0.10, 0.20], and honest CALIB selection costs 3.7% regret vs. the
+  (unattainable) TEST-optimal choice.
 - The 5:1 FN:FP cost ratio is a domain judgment made for this project, not empirically
   derived from real clinical-operations cost data — a real deployment would need that ratio
   validated by clinical-operations/portfolio-management stakeholders before trusting the
-  0.22 threshold operationally.
+  threshold operationally, and the M9 instability finding means the ratio and the threshold
+  need to be revisited together.

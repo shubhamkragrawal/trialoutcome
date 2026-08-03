@@ -29,8 +29,8 @@ REPO_ROOT = PACKAGE_DIR.parent.parent
 
 CATEGORICAL_FEATURES = ["phase", "allocation", "masking", "has_dmc_str", "sponsor_class"]
 NUMERIC_FEATURES = [
-    "log_enrollment_count",
-    "enrollment_missing",
+    # M9-1: log_enrollment_count / enrollment_missing removed as target
+    # leakage. See config.yaml dropped_features and decisions.md M9-1.
     "num_primary_outcomes",
     "num_sites",
     "has_results",
