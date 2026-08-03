@@ -50,3 +50,69 @@ def test_generate_summary_caps_at_three_reasons():
     summary = generate_summary(contributors, "HIGH RISK", 0.6)
     assert "(1)" in summary and "(2)" in summary and "(3)" in summary
     assert "(4)" not in summary
+
+
+# --- M9-3: sign-correctness and casing (review section 1.6) ------------------
+
+
+def test_high_risk_never_cites_a_risk_decreasing_factor_as_a_reason():
+    """The bug this test exists for: a HIGH RISK summary citing a *good*
+    sponsor track record as a reason FOR the flag."""
+    contributors = [
+        # Largest magnitude, but it pushes risk DOWN -- must not be a "reason".
+        {"feature": "sponsor_prior_termination_rate", "value": 0.02, "shap_contribution": -2.5},
+        {"feature": "num_sites", "value": 1, "shap_contribution": 0.4},
+    ]
+    summary = generate_summary(contributors, "high_risk", 0.81)
+
+    reasons_clause = summary.split("One factor argues against the flag")[0]
+    assert "low relative to the training population" not in reasons_clause
+    assert "the trial runs at 1 sites" in reasons_clause
+    # The opposing factor is surfaced, not silently dropped.
+    assert "One factor argues against the flag" in summary
+    assert "sponsor's prior termination rate is 2%" in summary
+
+
+def test_low_risk_cites_only_risk_decreasing_factors_as_reasons():
+    contributors = [
+        {"feature": "sponsor_prior_termination_rate", "value": 0.01, "shap_contribution": -1.8},
+        {"feature": "num_sites", "value": 1, "shap_contribution": 0.9},
+    ]
+    summary = generate_summary(contributors, "low_risk", 0.06)
+
+    reasons_clause = summary.split("One factor to watch")[0]
+    assert "sponsor's prior termination rate is 1%" in reasons_clause
+    assert "the trial runs at 1 sites" not in reasons_clause
+    assert "One factor to watch" in summary
+
+
+def test_human_readable_string_uses_uppercase_not_the_enum():
+    contributors = [{"feature": "num_sites", "value": 1, "shap_contribution": 0.4}]
+    high = generate_summary(contributors, "high_risk", 0.81)
+    assert "HIGH RISK" in high
+    assert "high_risk" not in high
+
+    low = generate_summary(
+        [{"feature": "num_sites", "value": 40, "shap_contribution": -0.4}], "low_risk", 0.04
+    )
+    assert "LOW RISK" in low
+    assert "low_risk" not in low
+
+
+def test_reasons_are_ordered_by_absolute_magnitude_within_direction():
+    contributors = [
+        {"feature": "num_sites", "value": 1, "shap_contribution": 0.2},
+        {"feature": "condition_rarity", "value": 2, "shap_contribution": 1.5},
+    ]
+    summary = generate_summary(contributors, "high_risk", 0.7)
+    assert summary.index("prior trials on record") < summary.index("the trial runs at 1 sites")
+
+
+def test_high_risk_with_no_risk_increasing_factors_says_so():
+    """Rather than inventing a justification from wrong-signed factors."""
+    contributors = [
+        {"feature": "num_sites", "value": 40, "shap_contribution": -0.6},
+    ]
+    summary = generate_summary(contributors, "high_risk", 0.55)
+    assert "none of its top factors point that way" in summary
+    assert "primarily because" not in summary

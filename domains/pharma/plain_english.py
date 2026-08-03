@@ -137,6 +137,42 @@ def _describe_contribution(contribution: dict) -> str:
     return f"{feature} is {value} ({direction})"
 
 
+# Human-readable renderings of the machine-readable `threshold_decision` enum.
+# M9-3: the API contract field itself is UNCHANGED (`high_risk` / `low_risk` --
+# it is part of the locked cross-project contract RegIntel builds against);
+# only the prose embedded in `plain_english_summary` is humanized. Any other
+# string (e.g. the "LOW RISK (missed)" label the error-analysis demo passes)
+# falls through unchanged.
+_DECISION_LABELS = {
+    "high_risk": "HIGH RISK",
+    "low_risk": "LOW RISK",
+}
+
+
+def _humanize_decision(threshold_decision: str) -> str:
+    return _DECISION_LABELS.get(threshold_decision, threshold_decision)
+
+
+def _partition_by_direction(
+    top_shap_contributors: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Purpose: Split SHAP contributors into those that push risk UP and those
+        that push risk DOWN, each ordered by absolute magnitude.
+    Leakage guard: N/A.
+    Failure mode: A contributor missing `shap_contribution` defaults to 0.0
+        and lands in the risk-decreasing bucket. That is the conservative
+        side to fail toward: a zero-signed factor is never cited as a
+        *reason for* a high-risk flag, so a malformed contributor can weaken
+        a summary but cannot fabricate a justification for one.
+    """
+    increasing = [c for c in top_shap_contributors if c.get("shap_contribution", 0.0) > 0]
+    decreasing = [c for c in top_shap_contributors if c.get("shap_contribution", 0.0) <= 0]
+    increasing.sort(key=lambda c: abs(c.get("shap_contribution", 0.0)), reverse=True)
+    decreasing.sort(key=lambda c: abs(c.get("shap_contribution", 0.0)), reverse=True)
+    return increasing, decreasing
+
+
 def generate_summary(
     top_shap_contributors: list[dict], threshold_decision: str, proba: float
 ) -> str:
@@ -146,18 +182,52 @@ def generate_summary(
         audience -- TrialOutcome spec Section 4a.
     Leakage guard: N/A -- pure string templating over already-computed
         SHAP output; touches no training data or labels.
-    Failure mode: If top_shap_contributors is empty, returns a summary with
-        no "primarily because" clause rather than raising -- an edge case
-        (a prediction with no dominant driver) that should be visible in
-        output, not crash the demo loop.
+
+    M9-3 CORRECTION (review section 1.6): this function previously cited the
+        top-3 contributors by magnitude as "reasons for the flag" REGARDLESS
+        of the sign of their SHAP contribution. A trial flagged high-risk
+        could therefore cite a *good* sponsor track record as a reason for
+        the high-risk flag -- incoherent in front of any stakeholder, and the
+        kind of thing that discredits every other number on the page. Factors
+        are now partitioned by sign: only risk-INCREASING factors justify a
+        HIGH RISK flag, only risk-DECREASING factors justify a LOW RISK one,
+        and the strongest factor pointing the other way is surfaced
+        separately as a mitigating/watch factor rather than silently dropped
+        (dropping it would overstate the model's confidence).
+
+    Failure mode: If no contributor points in the direction the decision
+        implies -- which would mean the flag disagrees with every one of its
+        own top drivers -- the summary says so explicitly rather than
+        inventing a justification from the wrong-signed factors. That case is
+        a genuine signal that the threshold and the explanation have come
+        apart, and it should be visible in the output, not smoothed over.
     """
-    reasons = [_describe_contribution(c) for c in top_shap_contributors[:3]]
-    if not reasons:
-        reason_text = "no single feature stood out as a dominant driver"
+    increasing, decreasing = _partition_by_direction(top_shap_contributors)
+    is_high_risk = threshold_decision == "high_risk" or str(threshold_decision).upper().startswith(
+        "HIGH"
+    )
+
+    if is_high_risk:
+        supporting, opposing, opposing_label = increasing, decreasing, "One factor argues against the flag"
+    else:
+        supporting, opposing, opposing_label = decreasing, increasing, "One factor to watch"
+
+    reasons = [_describe_contribution(c) for c in supporting[:3]]
+    if not top_shap_contributors:
+        reason_text = "-- no single feature stood out as a dominant driver"
+    elif not reasons:
+        reason_text = (
+            "though notably none of its top factors point that way -- "
+            "the flag rests on the threshold, not on any single driver"
+        )
     else:
         numbered = [f"({i + 1}) {reason}" for i, reason in enumerate(reasons)]
         reason_text = "primarily because: " + ", ".join(numbered)
-    return (
-        f"This trial is flagged {threshold_decision} "
+
+    summary = (
+        f"This trial is flagged {_humanize_decision(threshold_decision)} "
         f"({proba:.0%} estimated termination probability) {reason_text}."
     )
+    if opposing:
+        summary += f" {opposing_label}: {_describe_contribution(opposing[0])}."
+    return summary
