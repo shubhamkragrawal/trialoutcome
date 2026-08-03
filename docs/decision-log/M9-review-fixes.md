@@ -668,3 +668,284 @@ plus a broader case-insensitive `\b(prompt|brief|DoD)\b` scan both return zero h
 - **Interview question this maps to:** "How do you enforce code quality in CI?" — the
   answer is now visible in `ci.yml`'s `lint-and-type-check` job, and "why is your coverage
   floor only 25%?" has an honest answer instead of a made-up-sounding-authoritative one.
+
+---
+
+## Decision (review-driven, P1): imputation medians frozen at training time and loaded at serving, not recomputed from a single-row request
+
+- **What:** `domains/pharma/dataset_builder.py`'s `build_features()` fills
+  `num_primary_outcomes`, `num_sites`, and `sponsor_prior_termination_rate` NaNs
+  with `.median()` computed over the fetched population, before the temporal
+  split — this is TRAIN's own imputation, unchanged by this fix. The gap this
+  fix closes is downstream, at serving: `domains/pharma/serving/api.py`'s
+  `_row_from_trial_features()` had exactly one live "missing value" code path
+  (`sponsor_prior_termination_rate=None` on the request), and it was hardcoded
+  to `0.0` — not the training-time median — a documented limitation in the
+  code's own docstring since M5 ("deferred past M5's acceptance criteria").
+  Added `PharmaDatasetBuilder.compute_imputation_constants(raw)`, which
+  evaluates the exact same three `.median()` expressions `build_features()`
+  already uses, as a standalone, loggable dict. `register_model.py` now logs
+  this dict as an `imputation_constants.json` MLflow artifact alongside the
+  existing `condition_vocab.json`/`feature_schema.json` on every future
+  registration run. `api.py`'s `_load_bundle()` loads it and stores it on
+  `_PharmaModelBundle`; `_row_from_trial_features()` now fills the missing
+  `sponsor_prior_termination_rate` from that frozen constant instead of `0.0`.
+- **v45 backfilled without a retrain, per this fix's scope:** the constants
+  were computed from `data/raw_trials_cache.parquet` (the same cache M9-11's
+  retrain used to produce v45) and attached directly to v45's existing run
+  (`aa8ec5b5710b490d9b0963b15476bad0`) via `MlflowClient().log_dict(run_id=...)`
+  — no new run, no new registry version. Computed values:
+  `num_primary_outcomes=1.0`, `num_sites=2.0`,
+  `sponsor_prior_termination_rate≈0.01020408`.
+- **Scope decision, flagged rather than silently expanded:** the fix plan's
+  example JSON lists all three constants, but only `sponsor_prior_termination_rate`
+  has an `Optional`/missing-value path in `TrialFeatures` today —
+  `num_primary_outcomes`/`num_sites` are required (non-nullable) request
+  fields, so there is no live code path that would ever consume frozen
+  constants for them. All three are still computed and logged (parity with
+  the plan, and so the artifact doesn't need a second revision if those
+  fields are ever made optional), but only the one field with a genuine
+  missing-value path was wired into the request-handling code — making the
+  other two required fields optional as well was judged out of scope for a
+  bug fix about *stale* imputation, not a request to widen the schema.
+- **Test:** `tests/test_imputation_constants.py` (4 tests, no DB/MLflow
+  dependency): `compute_imputation_constants` reproduces `.median()` exactly
+  on a fixture with NaNs; a request with the field omitted uses the bundle's
+  frozen constant, not a hardcoded value; the constant a fixture's
+  `compute_imputation_constants` call produces is the *exact* value
+  `_row_from_trial_features` falls back to when that same dict is loaded onto
+  the bundle (the literal fixture-equality check the plan's DoD asked for); a
+  request that *does* supply the field is unaffected.
+- **Why (vs. alternatives):**
+    - *Recompute a "median" from the live request at serving:* rejected —
+      this is the bug being fixed; a median of one row is not a median, and
+      the pre-fix `0.0` fallback was an arbitrary constant with no connection
+      to the training distribution at all.
+    - *Refactor build_features()'s three fillna() calls to call the new
+      `compute_imputation_constants()` internally (single source of truth):*
+      not done — build_features() operates on `raw.copy()` inside the same
+      method scope those medians are computed from, so introducing a call to
+      a separate method there would need to thread a computed-once dict
+      through in a way that changes build_features()'s existing structure for
+      no behavior change; duplicating the three expressions (flagged
+      explicitly in `compute_imputation_constants`'s own docstring, with a
+      pointer to the test that would catch drift) was judged the smaller,
+      more auditable diff.
+    - *Widen `TrialFeatures` to make `num_primary_outcomes`/`num_sites`
+      optional too, to fully exercise all three logged constants:* rejected
+      per CLAUDE.md's scope-creep rule — nothing about this bug required
+      loosening those fields' required-ness; that would be a request-schema
+      change made because the tooling was already open, not because the fix
+      needed it.
+- **Failure mode:** `compute_imputation_constants` and `build_features()`
+  read the same three `.median()` expressions from two separate places in the
+  same file. If a future change to `build_features()`'s imputation logic
+  (e.g., switching `num_sites` to a different strategy) isn't mirrored in
+  `compute_imputation_constants`, the served fallback silently stops matching
+  what the model actually saw at training time, and nothing short of
+  `tests/test_imputation_constants.py`'s fixture-equality test (or noticing
+  the drift by inspection) would catch it — there is no automated coupling
+  between the two beyond that test.
+- **Scaling story (10x/100x):** the constants are three scalars computed once
+  per training run — irrelevant to row/model scale. The one axis this does
+  scale with is *feature count*: if more numeric features gain a
+  missing-value path in `TrialFeatures` in the future, each needs its own
+  entry in `compute_imputation_constants` and its own frozen-constant fallback
+  in `_row_from_trial_features` — a linear, not compounding, cost per field.
+- **Interview question this maps to:** "What happens if a request comes in
+  with a missing feature value?" — before this fix, the honest answer was
+  "an arbitrary hardcoded 0.0 with no connection to training"; after it, "the
+  exact median the model was trained against, frozen as an MLflow artifact
+  and loaded at serving startup, verified by a test that ties the two
+  together."
+
+---
+
+## Decision (review-driven, P1): `ml.prediction_log` added, `/predict` writes to it as a background task, `drift_job.py` gains a real `--source=prediction_log` mode with an honestly-documented schema gap
+
+- **What:** Drift monitoring (M6) has only ever compared TRAIN vs TEST
+  (`ml.training_dataset`), a proxy for "training population vs. a batch the
+  model hasn't seen," documented honestly as such since M6 because no live
+  scoring traffic has ever existed. This fix makes a real production
+  monitoring path possible: added `ml.prediction_log` to `schema.sql` (exact
+  columns per the M9 fix plan: `request_id`, `nct_id`, `proba`,
+  `threshold_decision`, `feature_pipeline_version`, `model_version`,
+  `features_hash`, `conformal_low`/`conformal_high`, `top_shap_feature`,
+  `latency_ms`, `created_at`, plus the two indexes the plan specified).
+  `domains/pharma/serving/api.py` gained: a `request_id` middleware (uuid4
+  per request, also returned as an `X-Request-ID` response header);
+  `_features_hash()` (sha256 of the exact scored feature row, for dedup/audit
+  without persisting the full row); `_log_prediction_background()`, wired
+  into both `/api/v1/predict` and `/api/v1/predict/nct/{nct_id}` via FastAPI
+  `BackgroundTasks` so the write happens strictly after the response is
+  already on the wire — it cannot add latency to what a caller experiences.
+  Any exception inside the write (DB down, schema not migrated, etc.) is
+  caught and printed to stdout, never re-raised: the API's fail-loud contract
+  (`_require_bundle()` returning 503 when the model isn't loaded) is
+  deliberately NOT extended to this path — a client must always get their
+  prediction even if the log DB is unreachable. `drift_job.py` gained a
+  `--source={training,prediction_log}` / `--lookback=N` CLI (`argparse`),
+  threaded into `PharmaDriftMonitor.__init__`/`load_current()`; `make drift`
+  now accepts `SOURCE=`/`LOOKBACK=` (`make drift SOURCE=prediction_log
+  LOOKBACK=14`), defaulting to the unchanged pre-existing `training` behavior
+  so `retrain_trigger.py`'s and `tests/test_retrain_trigger.py`'s existing
+  `PharmaDriftMonitor()` call sites (no args) are unaffected.
+- **Schema gap surfaced and handled explicitly, not silently glossed over:**
+  the plan's own `ml.prediction_log` schema (verbatim, landed as specified)
+  logs `proba`/`threshold_decision`/`features_hash`/etc. but does **not**
+  persist the full engineered feature vector a request was scored on — only
+  a hash of it. This means a feature-level Evidently `DataDriftPreset`
+  comparison (the kind `training` mode runs) has **zero columns in common**
+  between `ml.prediction_log` and the TRAIN reference, regardless of how many
+  predictions ever get logged — a real limitation of the specified schema,
+  not a bug in this fix's implementation of it. `PharmaDriftMonitor.run()`
+  detects the empty-or-non-comparable case explicitly (`current.empty or not
+  common_cols`) and logs an honest zero-comparison verdict
+  (`drifted=False, n_features_drifted=0, drift_share=0.0`) rather than either
+  crashing on a degenerate Evidently call over disjoint columns or fabricating
+  a "not drifted" result over data that was never actually compared. Verified
+  live against the real dev Postgres (not mocked): `make drift
+  SOURCE=prediction_log LOOKBACK=7` printed `(0, 13)` current rows and the
+  exact honest message before any traffic existed; a single real `/predict`
+  call via `fastapi.testclient.TestClient` was confirmed to write a row with
+  the correct `request_id` (matching the response's `X-Request-ID` header),
+  `model_version=45`, and a populated `features_hash`/`top_shap_feature`; then
+  re-running the same drift check showed `(1, 13)` current rows and **still**
+  `0` shared columns — confirming the gap is about column overlap, not row
+  count. The test row was deleted afterward (`DELETE FROM ml.prediction_log
+  WHERE request_id = ...`) so this manual verification doesn't masquerade as
+  real served traffic in the table going forward, matching M7's own precedent
+  of cleaning up synthetic test artifacts from live state.
+- **Why (vs. alternatives):**
+    - *Extend `ml.prediction_log`'s schema to also store the feature vector
+      (as JSONB, mirroring `ml.training_dataset.features`), closing the gap
+      immediately instead of just documenting it:* not done — the plan's DoD
+      specifies this exact schema verbatim and asks for the gap to be
+      documented, not silently expanded; a schema change beyond what was
+      specified is exactly the kind of unauthorized scope growth CLAUDE.md's
+      standing rule asks to flag before making. Documented as the real next
+      step instead.
+    - *Make the write synchronous (block the response until the log insert
+      completes):* rejected — the plan explicitly asks for async/background,
+      and a synchronous write would mean a slow or down log DB directly
+      degrades `/predict`'s latency or availability, the opposite of the
+      "API stays up if the log DB is down" requirement.
+    - *Let a prediction_log write failure propagate as a 5xx:* rejected for
+      the same reason — logging is best-effort by design; serving is not.
+    - *Skip the empty-batch guard and let Evidently run on a 0-shared-column
+      comparison:* not attempted directly, but reasoned through — Evidently's
+      `DataDriftPreset` over an empty common-column DataFrame either raises
+      or produces a metrics payload `check_thresholds()` can't parse
+      (`StopIteration` on the `DriftedColumnsCount` lookup, per
+      `core/monitoring/drift_base.py`'s own documented failure mode) — an
+      unhelpful crash in place of an honest, informative empty-result message.
+- **Failure mode:** the empty-or-non-comparable guard is keyed on `current.empty
+  or not common_cols` — if `ml.prediction_log` is ever extended to log even
+  one column that happens to share a name with a reference feature (unlikely
+  given the current schema, but not structurally prevented), `common_cols`
+  would become non-empty and Evidently would run a comparison over that one
+  column alone, silently producing a `drift_share` computed over a
+  near-meaningless single-column intersection rather than the honest
+  zero-comparison message — worth re-checking if this table's schema ever
+  changes.
+- **Scaling story (10x/100x):** the background-task write is O(1) per
+  request, off the response's critical path — irrelevant to request-rate
+  scale in the sense that it never slows a response down, though at very high
+  QPS the write itself would need to move off FastAPI's in-process
+  `BackgroundTasks` (which run in the same event loop / worker process) to a
+  real queue (Celery/RQ, or a managed log sink) to avoid competing with
+  request-handling threads for CPU — noted as the real 10x/100x answer, not
+  implemented here since current traffic is zero.
+- **Interview question this maps to:** "You said drift monitoring works —
+  walk me through what actually gets compared to what." Before this fix, the
+  honest answer was "TRAIN vs TEST, because there's no traffic, and there's
+  no mechanism to ever log real traffic even if there were." After it: "TRAIN
+  vs TEST as a dev proxy, or TRAIN vs the last N days of `ml.prediction_log`
+  once real traffic exists — and today, if you actually run that second mode,
+  it tells you honestly that it has nothing to compare yet, which is the
+  correct thing for it to say."
+
+---
+
+## Decision (review-driven, P1, LOCKED-CONTRACT CHANGE): `conformal_interval` renamed to `uncertainty_band`; `coverage_guarantee` field added
+
+- **What:** `PredictionResponse.conformal_interval` (a `[low, high]` band
+  derived from MAPIE's prediction *set* over labels, converted heuristically
+  — see `core/conformal.py`'s `predict_with_interval` docstring) renamed to
+  `uncertainty_band` in `core/serving/api_base.py`. Added a new
+  `CoverageGuarantee` submodel and `coverage_guarantee` field:
+  `{type: "label_set", target: <float>, empirical: <float>, note: str}`.
+  `domains/pharma/serving/api.py`'s `_predict_from_row()` populates `target`
+  from `b.conformal_wrapper.target_coverage` (the loaded MAPIE wrapper's own
+  attribute — the actual value `predict_with_interval()`'s margin is derived
+  from, not a separately-hardcoded copy) and `empirical` from the Production
+  run's logged `empirical_coverage` MLflow metric (0.9310761789600968 as of
+  the M9-11 retrain — loaded once in `_load_bundle()`, not recomputed or
+  hardcoded, so it stays correct across future retrains without a code
+  change). `tests/test_api_contract.py`'s field-name assertions updated
+  (`uncertainty_band`/`coverage_guarantee` in place of `conformal_interval`,
+  plus new assertions on `coverage_guarantee`'s sub-fields). `ml.prediction_log`'s
+  `conformal_low`/`conformal_high` DB columns (M9-7) are UNCHANGED — those are
+  internal storage column names, not part of the locked HTTP contract, so
+  this rename does not touch them; `api.py`'s write path now reads from
+  `response.uncertainty_band` instead.
+- **Locked-contract change, coordinated with RegIntel in the same session,
+  per CLAUDE.md's standing rule:** `01_REGINTEL_SPEC.md`'s Section 2 contract-
+  verification note and its M5 milestone DoD row (the two places that spec
+  states TrialOutcome's locked response shape verbatim) both updated to the
+  new field set, each with an explicit "Updated in M9-9 — see TrialOutcome
+  Section 12 for the rationale" pointer, per the fix plan's own instruction.
+  `02_TRIALOUTCOME_SPEC.md` Section 6's contract table and Section 12's
+  "Unresolved / explicitly deferred" and "Effect on cross-project contracts"
+  subsections all updated in the same pass so no file is left describing the
+  old shape as current.
+- **Verified end-to-end against the real Production model before landing
+  (not mocked):** `fastapi.testclient.TestClient` against the actual running
+  app (model v45) returned `coverage_guarantee: {type: "label_set", target:
+  0.9, empirical: 0.9310761789600968, note: "..."}` and `uncertainty_band:
+  [0.0, 0.0225]` for a real scored request — confirming both the rename and
+  the dynamically-loaded (not hardcoded) `target`/`empirical` values work
+  together correctly.
+- **Why (vs. alternatives):**
+    - *Option B (rebuild as a true conformalized probability interval via
+      `MapieRegressor` on `predict_proba`), per the fix plan's own more
+      expensive alternative:* not pursued this session — the plan itself
+      recommends Option A (rename + document) given the locked-contract
+      implications, and reserves Option B as a future revisit; doing both in
+      one session would conflate a naming/documentation fix with a modeling
+      methodology change, two decisions that deserve to be evaluated
+      independently.
+    - *Make `coverage_guarantee` a plain `dict` field instead of a typed
+      `CoverageGuarantee` submodel:* rejected — `SHAPContributor` already
+      establishes the pattern of typed submodels for structured sub-objects
+      in this response; a bare dict would be the only untyped field in an
+      otherwise fully-typed contract.
+    - *Hardcode `target`/`empirical` as the plan's example JSON literals
+      (0.90/0.946):* rejected — 0.946 is a pre-M9 number (the leaked-feature
+      model's coverage); hardcoding either value would silently go stale on
+      the next retrain exactly the way M9-8's imputation-constant fix was
+      about *not* doing that elsewhere in this same API. Both are read live
+      from the loaded conformal wrapper and the run's own logged metric.
+- **Failure mode:** if a future retrain's conformal-fitting step fails to log
+  `empirical_coverage` (e.g., `register_model.py`/notebook 05's logging call
+  is skipped or edited out), `_load_bundle()`'s `.get("empirical_coverage",
+  float("nan"))` fallback means `coverage_guarantee.empirical` would silently
+  serve `NaN` rather than raising — a client would get a response with a
+  non-numeric `empirical` field instead of a loud startup failure. Mirrors
+  the existing (pre-M9-9) fallback behavior for `pr_auc`/`ece` in the same
+  bundle, so this isn't a new failure mode introduced by this fix, but it's
+  worth naming since `coverage_guarantee` is new.
+- **Scaling story (10x/100x):** irrelevant to row/model scale — this is a
+  field-naming and documentation fix. The one thing that *would* need to
+  change at scale is Option B's eventual adoption (a true conformalized
+  probability interval): MAPIE's regression-style conformal has its own
+  computational profile independent of this rename, and swapping it in would
+  be a `core/conformal.py`-internal change that this rename's contract shape
+  (`uncertainty_band` as a `tuple[float, float]`) already accommodates
+  without a further schema change.
+- **Interview question this maps to:** "What does `conformal_interval`
+  guarantee?" — before this fix, the honest answer required a caveat the
+  field name didn't hint at ("nothing on the probability itself, actually,
+  despite the name"). After it: "`uncertainty_band`'s `coverage_guarantee`
+  field says so directly — label-set membership, 90% target, 93.1% empirical
+  on TEST, not a promise about the probability band."
