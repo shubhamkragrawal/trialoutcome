@@ -14,13 +14,23 @@ class ThresholdSelector:
     Purpose: Sweep classification thresholds against a caller-supplied cost
         matrix (FN cost, FP cost) to find the threshold minimizing expected
         cost, alongside F1-max and default-0.5 thresholds for comparison.
-    Leakage guard: N/A -- operates on already-computed (y_true, y_proba)
-        pairs; callers are responsible for passing calibrated TEST-split
-        probabilities, not train/calib (threshold selection is a downstream
-        reporting step, not a fitting step, so which split it runs on isn't
-        a leakage risk the way calibrator fitting is -- but the M3 notebook
-        by convention runs the final sweep on TEST so the reported cost
-        numbers reflect genuinely held-out performance).
+    Leakage guard: THRESHOLD SELECTION IS A ONE-PARAMETER FIT AND MUST RUN ON
+        A SPLIT HELD OUT FROM EVALUATION. Selecting one of 99 candidates by
+        minimizing an objective computed on a split is fitting that split,
+        regardless of how cheap the parameter is -- metrics reported at the
+        winning threshold on that same split are optimistically biased.
+        Callers must sweep on CALIB (find_cost_optimal_threshold) and report
+        on TEST (metrics_at_threshold). This class does NOT and CANNOT enforce
+        which split it is handed -- it sees only (y_true, y_proba) arrays, so
+        the discipline is the caller's responsibility.
+
+        CORRECTED IN M9 (review section 1.2). This docstring previously argued
+        that threshold selection was "a downstream reporting step, not a
+        fitting step, so which split it runs on isn't a leakage risk the way
+        calibrator fitting is." That reasoning was wrong and the M3 notebook
+        acted on it, sweeping and reporting on TEST. The bias is small (one
+        parameter, 5,700 rows) but the argument does not hold. See
+        decisions.md M9-4.
     Failure mode: N/A (class-level).
     """
 
@@ -37,8 +47,9 @@ class ThresholdSelector:
             compute expected_cost = FN_count*fn_cost + FP_count*fp_cost, and
             return the cost-optimal threshold alongside F1-max and the
             default 0.5, plus each candidate's expected cost.
-        Leakage guard: N/A -- pure post-hoc threshold search on already-
-            computed probabilities.
+        Leakage guard: pass CALIB probabilities here, never TEST -- this is
+            the fitting call (see the class docstring). Reporting at the
+            returned threshold belongs in metrics_at_threshold() against TEST.
         Failure mode: N/A -- a 99-point grid sweep over already-computed
             probabilities is O(n) per threshold and always terminates.
             Sweeping 0-1 by hand (rather than an optimizer) is fine here
