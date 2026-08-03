@@ -146,4 +146,3 @@ def test_serving_still_uses_request_value_when_field_supplied():
     row = _row_from_trial_features(trial, b)
 
     assert row.iloc[0]["sponsor_prior_termination_rate"] == 0.02
-
