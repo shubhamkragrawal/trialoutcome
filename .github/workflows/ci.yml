@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-unit:
+    runs-on: ubuntu-latest
+    env:
+      # evidently (imported by core/monitoring/drift_base.py, exercised by
+      # tests/test_drift_base.py) pulls in nltk transitively. NLTK 2026's
+      # own CWD-import security hook (CWE-427 mitigation) false-positives
+      # whenever a project's venv/site-packages live inside the checked-out
+      # repo root -- true for GitHub Actions' default checkout layout, not
+      # an actual hijack risk here. NLTK ships a documented escape hatch for
+      # exactly this case: NLTK_DISABLE_IMPORT_SECURITY=1 (see
+      # core/monitoring/drift_base.py's module docstring and decisions.md's
+      # M6 entry).
+      NLTK_DISABLE_IMPORT_SECURITY: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        # tests/test_api_contract.py is excluded: it's an integration suite
+        # that requires the FastAPI service already running inside a live
+        # Docker container (`make serve` + `make test-api`), which this job
+        # does not stand up. Everything else under tests/ is a fast,
+        # DB-free unit test.
+        run: pytest tests/ -v --ignore=tests/test_api_contract.py
+
+  drift-check:
+    runs-on: ubuntu-latest
+    needs: test-unit
+    env:
+      NLTK_DISABLE_IMPORT_SECURITY: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Mirrors the PharmaPulse Postgres instance this project normally
+          # targets (see .env.example) -- same db/user names, a throwaway
+          # CI-only password (not a real secret).
+          POSTGRES_DB: pharmapulse
+          POSTGRES_USER: pharmapulse_user
+          POSTGRES_PASSWORD: ci_password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U pharmapulse_user -d pharmapulse"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Install uv
+        # This project's Makefile targets (db-init, drift) invoke `uv run`
+        # directly (per CLAUDE.md: "Use uv add for all dependency
+        # management, never pip install") -- installing uv here lets CI run
+        # the exact same `make db-init` / `make drift` commands a developer
+        # would run locally, instead of a parallel CI-only command path
+        # that could drift out of sync with the Makefile.
+        run: pip install uv
+
+      - name: Sync dependencies (uv.lock)
+        run: uv sync --frozen
+
+      - name: Create .env for CI
+        # This project's Makefile does `include .env` unconditionally, and
+        # domains/pharma/dataset_builder.py reads POSTGRES_* via
+        # os.environ[...] (see config.yaml's db.host_env/port_env/... keys)
+        # -- both need a real .env file to exist, which is gitignored and
+        # never committed. Values here match the postgres service container
+        # above and .env.example's documented shape exactly.
+        run: |
+          cat > .env <<EOF
+          POSTGRES_HOST=localhost
+          POSTGRES_PORT=5433
+          POSTGRES_DB=pharmapulse
+          POSTGRES_USER=pharmapulse_user
+          POSTGRES_PASSWORD=ci_password
+          MLFLOW_TRACKING_URI=file:./mlruns
+          EOF
+
+      - name: Initialize ml schema (make db-init)
+        run: make db-init
+
+      - name: Seed synthetic training_dataset fixture
+        run: |
+          psql "host=localhost port=5433 dbname=pharmapulse user=pharmapulse_user password=ci_password" \
+            -f tests/fixtures/seed_training_data.sql
+
+      - name: Run drift job (make drift)
+        # IMPORTANT DISTINCTION: this validates that the drift job runs
+        # end-to-end against a real Postgres instance -- loads reference +
+        # current batches, runs Evidently, writes an HTML report, logs a
+        # row to ml.drift_log -- without erroring. It does NOT validate that
+        # the drift verdict itself is meaningful. tests/fixtures/seed_training_data.sql
+        # is 50 synthetic rows with no genuine feature-distribution shift
+        # deliberately engineered between its 'train' and 'test' rows, so
+        # Evidently will not (and is not expected to) flag real drift on
+        # this fixture. Only the job's plumbing is under test here -- see
+        # that fixture file's own header comment.
+        run: make drift
+
+      - name: Upload drift report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report
+          path: reports/*.html
+
+  retrain-trigger-test:
+    runs-on: ubuntu-latest
+    needs: drift-check
+    env:
+      NLTK_DISABLE_IMPORT_SECURITY: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pharmapulse
+          POSTGRES_USER: pharmapulse_user
+          POSTGRES_PASSWORD: ci_password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U pharmapulse_user -d pharmapulse"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Sync dependencies (uv.lock)
+        run: uv sync --frozen
+
+      - name: Create .env for CI
+        run: |
+          cat > .env <<EOF
+          POSTGRES_HOST=localhost
+          POSTGRES_PORT=5433
+          POSTGRES_DB=pharmapulse
+          POSTGRES_USER=pharmapulse_user
+          POSTGRES_PASSWORD=ci_password
+          MLFLOW_TRACKING_URI=file:./mlruns
+          EOF
+
+      - name: Initialize ml schema (make db-init)
+        run: make db-init
+
+      - name: Run M7 retrain-trigger / version-mismatch / rollback tests
+        # IMPORTANT DISTINCTION (same pattern as drift-check's own comment
+        # above): this job validates that the M7 mechanism *exists* and is
+        # wired up -- pytest collects and runs all three files -- not that a
+        # real drift-triggered retrain or rollback executes inside CI itself.
+        #
+        # All three tests are proven to work for real (see decisions.md's M7
+        # entry): they retrain the actual XGBoost champion via
+        # domains/pharma/dataset_builder.py's fetch_raw() (which needs either
+        # a cached data/raw_trials_cache.parquet or a live `marts` schema)
+        # and compare/rollback against a REAL registered MLflow Production
+        # model. Neither exists on a fresh checkout or this ephemeral
+        # Postgres service -- `make db-init` only creates the `ml` schema,
+        # never `marts` (that lives on the separate PharmaPulse-owned
+        # instance this project normally targets), and mlruns/ is gitignored
+        # so a fresh CI checkout starts with zero registered models.
+        #
+        # Building a synthetic `marts` fixture (and a way to bootstrap a
+        # fixture Production registration without register_model.py's
+        # real-data-calibrated `EXPECTED_PR_AUC_TEMPORAL` reproducibility
+        # assertion, which would fail against any synthetic substitute) was
+        # considered and deliberately deferred as scope beyond M7's actual
+        # ask. Each test therefore requests tests/conftest.py's
+        # `real_dev_state` fixture, which skips (not fails, not silently
+        # excludes) with a clear, visible reason when these prerequisites
+        # are absent -- so this step is expected to report "3 skipped" in
+        # CI, and "3 passed" on a real developer machine with a built
+        # dataset and a registered Production model.
+        run: pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py tests/test_rollback.py -v
