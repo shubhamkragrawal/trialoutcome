@@ -1,0 +1,103 @@
+# TrialOutcome M8 -- Scoped Kubernetes Deploy
+#
+# Wraps ONLY the /predict FastAPI service (domains/pharma/serving/api.py).
+# The rest of the portfolio stays on Docker Compose -- see README's "Scoped
+# Kubernetes deploy" section for why.
+#
+# hostPath volume limitation (flagged, not hidden): mlruns/ is mounted via
+# hostPath at the SAME absolute path used by docker-compose.yml's bind mount
+# (see decisions.md M5 entry -- MLflow's local file store bakes each run's
+# absolute host path into its metadata, so the mount path inside the
+# container/pod must match exactly). hostPath only works because this is a
+# single-node-equivalent local k3d cluster where every node was started with
+# `k3d cluster create ... --volume <mlruns>:<same path>@all` (see
+# docs/k8s_setup.md) -- k3d nodes are themselves Docker containers, so without
+# that node-level bind mount at cluster-creation time, hostPath would resolve
+# inside the k3d node's own container filesystem, not this machine's real
+# mlruns/ directory. This does NOT generalize past single-node local k3d: a
+# real multi-node cluster needs either a PersistentVolumeClaim backed by
+# network storage (each node would otherwise see a different, empty
+# hostPath) or, better, a remote MLflow tracking server with S3/GCS-backed
+# artifacts, so artifact URIs are storage keys instead of host filesystem
+# paths. See README's "What I'd change at production scale" section.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trialoutcome-api
+  labels:
+    app: trialoutcome-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trialoutcome-api
+  template:
+    metadata:
+      labels:
+        app: trialoutcome-api
+    spec:
+      containers:
+        - name: trialoutcome-api
+          image: trialoutcome-api:m8
+          imagePullPolicy: IfNotPresent  # image is loaded locally via `k3d image import`, never pulled from a registry
+          ports:
+            - containerPort: 8000
+          env:
+            # Postgres stays external to the cluster for this demo --
+            # host.k3d.internal is k3d's equivalent of Docker Desktop's
+            # host.docker.internal (see docker-compose.yml's identical
+            # POSTGRES_HOST override and its own note on why).
+            - name: POSTGRES_HOST
+              value: "host.k3d.internal"
+            - name: POSTGRES_PORT
+              value: "5433"
+            - name: POSTGRES_DB
+              value: "pharmapulse"
+            - name: POSTGRES_USER
+              value: "pharmapulse_user"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trialoutcome-postgres-secret
+                  key: POSTGRES_PASSWORD
+            # Same absolute-path pattern as docker-compose.yml's
+            # MLFLOW_TRACKING_URI -- see the hostPath note above.
+            - name: MLFLOW_TRACKING_URI
+              value: "file:///Users/shubhamagrawal/Documents/MS_fall_25/MS_fall_25_uni/ds_projects/trialoutcome/mlruns"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: mlruns
+              mountPath: /Users/shubhamagrawal/Documents/MS_fall_25/MS_fall_25_uni/ds_projects/trialoutcome/mlruns
+          livenessProbe:
+            # Empirically measured cold-start time (container start ->
+            # /ready returning 200, includes MLflow artifact download +
+            # model deserialization) was ~5s against this same image on this
+            # machine (see decisions.md M8 entry) -- initialDelaySeconds=15
+            # gives ~3x margin so liveness never fires mid-load and kills a
+            # pod that's simply still starting.
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            # Shorter initial delay is fine here -- a 503 from /ready just
+            # withholds traffic (doesn't kill the pod), unlike liveness.
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: mlruns
+          hostPath:
+            path: /Users/shubhamagrawal/Documents/MS_fall_25/MS_fall_25_uni/ds_projects/trialoutcome/mlruns
+            type: Directory
