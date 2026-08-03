@@ -7,8 +7,35 @@ on:
     branches: [main]
 
 jobs:
+  lint-and-type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Sync dependencies (uv.lock)
+        run: uv sync --frozen
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      # mypy runs on core/ only -- see pyproject.toml's [tool.mypy] comment
+      # for why domains/ and tests/ aren't checked yet.
+      - name: mypy (core/)
+        run: uv run mypy core/
+
   test-unit:
     runs-on: ubuntu-latest
+    needs: lint-and-type-check
     env:
       # evidently (imported by core/monitoring/drift_base.py, exercised by
       # tests/test_drift_base.py) pulls in nltk transitively. NLTK 2026's
@@ -30,8 +57,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run unit tests
-        run: pytest tests/ -v --ignore=tests/test_api_contract.py
+      - name: Run unit tests with coverage floor
+        # M9-12: 25% is a non-regression tripwire, not a target -- measured
+        # coverage on this fast (DB/MLflow-free) suite is ~31% today across
+        # core/+domains/. Several core/ modules (conformal.py, explain.py,
+        # threshold_selector.py, serving/api_base.py) sit at 0% because
+        # they're currently exercised only by the DB/MLflow-dependent
+        # integration tests in the retrain-trigger-test job below, which
+        # this job's fast suite doesn't run. Raising this meaningfully
+        # (60-80%) requires writing new fast unit tests for those modules --
+        # out of scope for this fix, tracked as a P1/P2 follow-up.
+        run: |
+          pytest tests/ -v --ignore=tests/test_api_contract.py \
+            --cov=core --cov=domains --cov-report=term-missing --cov-fail-under=25
 
   drift-check:
     runs-on: ubuntu-latest

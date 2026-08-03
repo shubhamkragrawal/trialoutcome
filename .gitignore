@@ -21,3 +21,6 @@ reports/*.html
 logs/
 final_review.md
 docs/M9_P0_REVIEW.md
+
+# pytest-cov artifact (M9-12's --cov-fail-under gate regenerates this locally on every run)
+.coverage
