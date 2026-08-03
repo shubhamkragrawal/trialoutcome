@@ -52,10 +52,19 @@ class TrialFeatures(BaseModel):
     default for a real, importance-ranked feature (has_results) -- both worse
     than fixing the schema to match reality. `intervention_model` is dropped;
     `has_results` is added as a required field.
+
+    M9-1 DEPRECATION: `log_enrollment_count` is still ACCEPTED but is now
+    IGNORED. enrollment_count was dropped from the feature set in M9 as target
+    leakage (see decisions.md M9-1). The field is kept as an optional no-op
+    rather than deleted so RegIntel's `trial_risk` tool wrapper -- which builds
+    request bodies against this schema -- keeps working without a coordinated
+    release. It should be removed from both sides at the next contract
+    revision. Requests that omit it behave identically to requests that
+    supply it.
     """
 
     phase: str
-    log_enrollment_count: float
+    log_enrollment_count: Optional[float] = None  # M9-1: accepted, ignored.
     num_primary_outcomes: int
     num_sites: int
     has_dmc: Optional[bool] = None
@@ -193,11 +202,8 @@ def _row_from_trial_features(trial: TrialFeatures, b: _PharmaModelBundle) -> pd.
     Purpose: Turn a raw TrialFeatures request body into the one-hot-expanded
         feature row the Production pipeline expects.
     Leakage guard: N/A -- inference only.
-    Failure mode (documented limitation): `enrollment_missing` is always set
-        to 0 here -- a direct feature POST has no way to signal "this trial's
-        real enrollment was unknown," unlike the NCT-lookup path, which
-        reads the true value from the persisted feature JSONB. Similarly,
-        `sponsor_prior_termination_rate=None` defaults to 0.0 rather than the
+    Failure mode (documented limitation): `sponsor_prior_termination_rate=None`
+        defaults to 0.0 rather than the
         TRAIN-split median `config.yaml`'s missingness_policy specifies --
         replicating that exact median in live serving would require
         persisting it as a training-time artifact, deferred past M5's DoD.
@@ -211,8 +217,8 @@ def _row_from_trial_features(trial: TrialFeatures, b: _PharmaModelBundle) -> pd.
         "masking": trial.masking if trial.masking is not None else "unknown",
         "has_dmc_str": has_dmc_str,
         "sponsor_class": trial.sponsor_class if trial.sponsor_class is not None else "unknown",
-        "log_enrollment_count": trial.log_enrollment_count,
-        "enrollment_missing": 0,
+        # M9-1: trial.log_enrollment_count is deliberately NOT read here --
+        # the field is accepted for backward compatibility and ignored.
         "num_primary_outcomes": trial.num_primary_outcomes,
         "num_sites": trial.num_sites,
         "has_results": trial.has_results,

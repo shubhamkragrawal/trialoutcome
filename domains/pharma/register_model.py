@@ -37,11 +37,20 @@ from domains.pharma.train_pipeline import (
 
 EXPERIMENT_NAME = "trialoutcome_m2"
 REGISTERED_MODEL_NAME = "trialoutcome_xgb_calibrated"
-THRESHOLD = 0.22
+# M9-4: CALIB-selected (was 0.22, TEST-selected). config.yaml's
+# model.threshold_decision is the source of truth the API reads at load time;
+# this constant only feeds the logged MLflow param. Keep them in sync.
+THRESHOLD = 0.14
 
 # Logged hyperparams for MLflow run c4a4d0300bd949f8bb07b7c48417be4d (M2 XGBoost
 # champion, CV-selected). Reproduced exactly here per decisions.md's M3 refit
 # convention -- see that run's params in the MLflow UI for provenance.
+#
+# M9-1: hyperparameters are UNCHANGED (deliberately -- a single retrain on the
+# corrected feature set, not a fresh 32-trial Optuna sweep, so the before/after
+# delta isolates the feature change rather than confounding it with a new
+# search). The M2 run itself was trained WITH the leaked enrollment features,
+# so this refit no longer reproduces c4a4d030's 0.8877613220680413.
 XGBOOST_BEST_PARAMS = dict(
     n_estimators=452,
     max_depth=3,
@@ -51,7 +60,17 @@ XGBOOST_BEST_PARAMS = dict(
     min_child_weight=3,
 )
 XGBOOST_BEST_RUN_ID = "c4a4d0300bd949f8bb07b7c48417be4d"
-EXPECTED_PR_AUC_TEMPORAL = 0.8877613220680413
+
+# M9-1 RE-BASELINE. Was 0.8877613220680413 (the leaked M2 champion). The
+# assertion below is a feature-pipeline-drift tripwire, not a claim that this
+# refit reproduces an M2 run -- it cannot, since M2's feature set included
+# log_enrollment_count/enrollment_missing. Re-baselined against the M9
+# no-enrollment retrain on the same temporal split and condition vocabulary.
+# If this assertion fires, the feature pipeline moved: diff
+# dataset_builder.feature_columns() and train_pipeline.NUMERIC_FEATURES
+# against decisions.md M9-1 before changing this number.
+EXPECTED_PR_AUC_TEMPORAL = 0.6483783386043787
+PRE_M9_LEAKED_PR_AUC_TEMPORAL = 0.8877613220680413  # kept for the README's before/after table
 
 
 def main() -> None:
@@ -92,9 +111,12 @@ def main() -> None:
     roc_check = float(roc_auc_score(test["label"], proba_test_raw))
     print(f"Refit sanity check -- pr_auc_temporal={pr_check:.6f} (expected {EXPECTED_PR_AUC_TEMPORAL:.6f})")
     assert abs(pr_check - EXPECTED_PR_AUC_TEMPORAL) < 1e-6, (
-        "refit does not match logged run c4a4d0300bd949f8bb07b7c48417be4d -- feature pipeline drifted"
+        f"refit pr_auc_temporal={pr_check:.6f} != M9 baseline "
+        f"{EXPECTED_PR_AUC_TEMPORAL:.6f} -- the feature pipeline drifted. Do not "
+        "re-baseline this constant without confirming enrollment_count has not "
+        "come back into the feature set (see decisions.md M9-1)."
     )
-    print("Refit reproduces the logged run exactly.")
+    print("Refit reproduces the M9 no-enrollment baseline exactly.")
 
     # --- Wrap the already-fitted pipeline with sklearn's CalibratedClassifierCV
     # in isotonic mode, fit on CALIB only. NOTE (deviation from the M5 prompt's
