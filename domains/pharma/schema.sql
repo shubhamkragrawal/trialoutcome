@@ -46,3 +46,32 @@ CREATE TABLE IF NOT EXISTS ml.retrain_log (
     promoted BOOL DEFAULT FALSE,
     promoted_at TIMESTAMPTZ
 );
+
+-- ml.prediction_log DDL (M9-7 -- makes drift monitoring's
+-- --source=prediction_log mode real instead of a proxy; see
+-- domains/pharma/monitoring/drift_job.py's module docstring and
+-- decisions.md M9-7 for what "real" means given this table's schema does
+-- not persist the full engineered feature vector, only proba/decision/hash).
+-- Also created idempotently by domains/pharma/serving/api.py's background
+-- write path itself, so `/predict` works even if db-init hasn't been re-run
+-- since this table was added -- same pattern ml.drift_log/ml.retrain_log use.
+CREATE TABLE IF NOT EXISTS ml.prediction_log (
+    id BIGSERIAL PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    nct_id TEXT,
+    proba NUMERIC(6,5) NOT NULL,
+    threshold_decision TEXT NOT NULL,
+    feature_pipeline_version TEXT NOT NULL,
+    model_version INT NOT NULL,
+    features_hash TEXT NOT NULL,
+    conformal_low NUMERIC(6,5),
+    conformal_high NUMERIC(6,5),
+    top_shap_feature TEXT,
+    latency_ms INT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_log_created_at
+    ON ml.prediction_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prediction_log_feature_version
+    ON ml.prediction_log(feature_pipeline_version);

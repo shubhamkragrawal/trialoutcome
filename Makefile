@@ -29,8 +29,11 @@ test-api:
 # nltk 2026's CWD-import security hook false-positives whenever the venv
 # lives inside the project root (true here) -- see
 # core/monitoring/drift_base.py's module docstring.
+# M9-7: SOURCE=training (default) or SOURCE=prediction_log LOOKBACK=7 (days).
+# Usage: make drift / make drift SOURCE=prediction_log LOOKBACK=14
 drift:
-	NLTK_DISABLE_IMPORT_SECURITY=1 uv run python -m domains.pharma.monitoring.drift_job
+	NLTK_DISABLE_IMPORT_SECURITY=1 uv run python -m domains.pharma.monitoring.drift_job \
+		--source $(or $(SOURCE),training) $(if $(LOOKBACK),--lookback $(LOOKBACK),)
 
 # M7: reacts to the latest ml.drift_log verdict -- retrains + registers to
 # Staging on a real breach; no-ops (prints and exits 0) otherwise. Pass
