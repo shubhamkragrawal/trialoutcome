@@ -171,5 +171,58 @@ jobs:
         run: make db-init
 
       - name: Run M7 retrain-trigger / version-mismatch / rollback tests
+        # M9-2: `uv sync --frozen` above installs into an isolated .venv/,
+        # not onto PATH -- a bare `pytest` here would resolve to whatever
+        # (if anything) happens to be installed system-wide, not the
+        # project's pinned dependencies. `uv run` is required, matching the
+        # Makefile's own convention (every target invokes `uv run python
+        # ...` internally) and CLAUDE.md's standing rule.
+        run: |
+          uv run pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py \
+            tests/test_rollback.py -v --junitxml=m7-results.xml
 
-        run: pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py tests/test_rollback.py -v
+      - name: Warn if all M7 tests were skipped
+        # M9-2 (review section 2.1). Two things are true at once here, and
+        # this step is deliberately shaped around both:
+        #
+        # 1. tests/conftest.py's real_dev_state fixture skips these three
+        #    tests when this CI runner lacks a registered Production model
+        #    and a marts-backed raw-feature cache. CI's ephemeral Postgres
+        #    only ever gets the `ml` schema (via `make db-init`), never
+        #    `marts` -- building a synthetic marts fixture (and a way to
+        #    bootstrap a fixture Production registration without
+        #    register_model.py's real-data reproducibility assertion) was
+        #    explicitly considered and deferred as scope beyond M7's actual
+        #    ask (see decisions.md's M7 entry). So on THIS CI setup, as it
+        #    exists today, all three tests skipping is the CORRECT, expected
+        #    outcome, not a bug -- a hard failure here would make this job
+        #    permanently red for a known, already-approved scope decision,
+        #    which is a worse failure mode than the one being fixed.
+        # 2. What the pre-M9 bug actually did wrong wasn't "skips in CI" --
+        #    it's that the skip was INVISIBLE. The job reported plain green,
+        #    identical to a run that had genuinely exercised M7's retrain/
+        #    rollback machinery. That's the false-confidence problem.
+        #
+        # So: `continue-on-error: true` on this step means an all-skipped
+        # run shows a visible yellow warning in the Actions UI on every run
+        # (impossible to mistake for "tests genuinely passed") without
+        # turning the whole pipeline red for a documented, deferred-scope
+        # limitation. If the marts fixture is ever built and these tests
+        # start running for real in CI, this step passes silently like any
+        # other -- no further change needed here.
+        continue-on-error: true
+        run: |
+          uv run python -c "
+          import xml.etree.ElementTree as ET
+          root = ET.parse('m7-results.xml').getroot()
+          skipped = int(root.attrib.get('skipped', 0))
+          total = int(root.attrib.get('tests', 0))
+          assert total > 0, 'No M7 tests collected'
+          assert skipped < total, (
+              f'All {total} M7 tests skipped -- this CI runner has no marts schema or '
+              'registered Production model (deferred scope, see decisions.md M7 entry), '
+              'so this job is not asserting any real M7 behavior right now. Not failing '
+              'the build for a known limitation, but this warning exists so that fact '
+              'stays visible instead of silently reading as a normal pass.'
+          )
+          "

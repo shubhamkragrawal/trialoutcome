@@ -34,6 +34,31 @@ from mlflow.exceptions import MlflowException
 from domains.pharma.monitoring.retrain_trigger import REGISTERED_MODEL_NAME, REPO_ROOT, _set_tracking_uri
 
 def _has_real_dev_state() -> bool:
+    """
+    Purpose: True only when BOTH a registered Production model version and
+        the marts-backed raw-features cache exist -- the two prerequisites
+        the M7 integration tests need.
+    Leakage guard: N/A.
+    Failure mode (M9-2 fix, review section 2.1): the pre-M9 version of this
+        function had two scoping bugs that together made the
+        `retrain-trigger-test` CI job green while asserting nothing:
+        (1) `_set_tracking_uri()` was imported but never called, so
+        `MlflowClient()` read whatever tracking URI happened to be ambient
+        rather than this repo's own mlruns/ -- fixed by calling it first,
+        same as every other MLflow entrypoint in this project.
+        (2) `has_raw_cache` was only assigned inside the `except`
+        block. On a dev machine with a real registered model, the `try`
+        succeeds and `has_raw_cache` is never assigned, so the final
+        `return` raised `UnboundLocalError` -- surfacing as an ERROR on every
+        one of the three M7 tests, not a clean pass or skip. In CI, no
+        registered model exists, `MlflowException` fires, `has_raw_cache`
+        gets computed (False, fresh checkout) and the fixture skips cleanly
+        -- so the dev-machine ERROR and the CI SKIP were two different bugs
+        that happened to both look like "not running," which is what let the
+        CI job report green while covering zero of the behavior it exists to
+        protect. Fixed by computing `has_raw_cache` unconditionally.
+    """
+    _set_tracking_uri()
     client = MlflowClient()
     try:
         has_production_model = bool(
@@ -41,8 +66,7 @@ def _has_real_dev_state() -> bool:
         )
     except MlflowException:
         has_production_model = False
-        # has_production_model = bool(client.get_latest_versions(REGISTERED_MODEL_NAME, stages=["Production"]))
-        has_raw_cache = (REPO_ROOT / "data" / "raw_trials_cache.parquet").exists()
+    has_raw_cache = (REPO_ROOT / "data" / "raw_trials_cache.parquet").exists()
     return has_production_model and has_raw_cache
 
 @pytest.fixture
