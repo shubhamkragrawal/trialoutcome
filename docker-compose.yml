@@ -1,0 +1,37 @@
+services:
+  trialoutcome-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./mlruns:/app/mlruns # model artifacts
+      # NOTE (local-file-MLflow-store limitation, flagged not hidden): the
+      # local `mlruns/` tracking store bakes each run's ABSOLUTE host path
+      # into its metadata at logging time. mlflow.sklearn.load_model() can
+      # only resolve that path if it resolves identically inside the
+      # container -- so mlruns/ is bind-mounted a SECOND time at the exact
+      # same absolute path it has on the host, and MLFLOW_TRACKING_URI below
+      # points at that same absolute path. This hardcodes a host-specific
+      # path into this compose file, which does not generalize past this
+      # machine -- the real fix at production scale is a proper MLflow
+      # tracking server backed by remote artifact storage (S3/GCS), where
+      # artifact URIs are storage keys, not host filesystem paths (see
+      # decisions.md's M5 entry on this).
+      - ./mlruns:/Users/shubhamagrawal/Documents/MS_fall_25/MS_fall_25_uni/ds_projects/trialoutcome/mlruns
+      - ./domains/pharma/config.yaml:/app/domains/pharma/config.yaml
+    env_file:
+      - .env
+    environment:
+      # NOTE (deviation from the M5 prompt's literal DB_HOST/DB_PORT/DB_NAME/
+      # DB_USER names): domains/pharma/dataset_builder.py's _get_engine()
+      # reads os.environ["POSTGRES_HOST"] etc. directly (see config.yaml's
+      # db.host_env/port_env/... keys) -- there is no DB_HOST/DB_PORT/DB_NAME/
+      # DB_USER anywhere in this codebase. Using the prompt's literal names
+      # would leave the container's Postgres connection silently unconfigured
+      # (KeyError at startup). `env_file: .env` supplies the real
+      # POSTGRES_PORT/POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD unmodified;
+      # only POSTGRES_HOST is overridden here, since `localhost` inside the
+      # container is the container itself, not the host running Postgres.
+      - POSTGRES_HOST=host.docker.internal
+      - MLFLOW_TRACKING_URI=file:///Users/shubhamagrawal/Documents/MS_fall_25/MS_fall_25_uni/ds_projects/trialoutcome/mlruns
+    depends_on: []

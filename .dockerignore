@@ -1,0 +1,11 @@
+__pycache__/
+.git/
+notebooks/
+docs/
+logs/
+*.ipynb
+*.png
+.venv/
+data/
+ai_portfolio/
+.env
