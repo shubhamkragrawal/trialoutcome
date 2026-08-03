@@ -71,7 +71,9 @@ XGBOOST_BEST_RUN_ID = "c4a4d0300bd949f8bb07b7c48417be4d"
 # dataset_builder.feature_columns()/train_pipeline.NUMERIC_FEATURES against
 # decisions.md M9-11 before changing this number.
 EXPECTED_PR_AUC_TEMPORAL = 0.6192941645955544
-PRE_M9_11_PR_AUC_TEMPORAL = 0.6483783386043787  # M9-1 baseline, kept for the README's before/after table
+PRE_M9_11_PR_AUC_TEMPORAL = (
+    0.6483783386043787  # M9-1 baseline, kept for the README's before/after table
+)
 PRE_M9_LEAKED_PR_AUC_TEMPORAL = 0.8877613220680413  # pre-M9-1 (enrollment leak), same table
 
 
