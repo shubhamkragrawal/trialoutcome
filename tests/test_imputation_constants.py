@@ -9,6 +9,13 @@ argument passed to it.
 """
 
 from __future__ import annotations
+import os
+os.environ.setdefault("POSTGRES_HOST", "localhost")
+os.environ.setdefault("POSTGRES_PORT", "5433")
+os.environ.setdefault("POSTGRES_DB", "pharmapulse")
+os.environ.setdefault("POSTGRES_USER", "test")
+os.environ.setdefault("POSTGRES_PASSWORD", "test")
+os.environ.setdefault("MLFLOW_TRACKING_URI", "file:./mlruns")
 
 import numpy as np
 import pandas as pd
