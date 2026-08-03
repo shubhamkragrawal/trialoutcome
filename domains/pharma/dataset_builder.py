@@ -60,19 +60,50 @@ primary_condition AS (
     ) ranked
     WHERE rn = 1
 ),
--- Point-in-time sponsor history: only trials started strictly before this one.
+-- M9-11: a historical trial's resolution date, trusted ONLY when
+-- ClinicalTrials.gov's own completionDateStruct.type is ACTUAL, not
+-- ESTIMATED. marts.fct_trials.completion_date is populated even for trials
+-- that are still RECRUITING/ACTIVE (an ESTIMATED future target date) and,
+-- critically, for most WITHDRAWN (46% ESTIMATED) and SUSPENDED (92%
+-- ESTIMATED) trials too -- an ESTIMATED date is the original planned
+-- completion target, not evidence the trial's outcome was known by that
+-- date. Mirrors M9-1's enrollment_type ACTUAL/ESTIMATED distinction.
+hist_resolution AS (
+    SELECT
+        f.nct_id,
+        f.completion_date AS resolved_completion_date
+    FROM marts.fct_trials f
+    JOIN raw.ct_studies s ON s.nct_id = f.nct_id
+    WHERE s.payload -> 'protocolSection' -> 'statusModule'
+              -> 'completionDateStruct' ->> 'type' = 'ACTUAL'
+),
+-- Point-in-time sponsor history: only trials started strictly before this
+-- one AND, per M9-11, only counted toward the termination rate once their
+-- outcome was actually resolved (ACTUAL completion date) before this
+-- trial's start_date -- not merely once their (possibly still-pending,
+-- present-day) final status happens to be known today. A prior trial whose
+-- true resolution date is unknown or postdates t.start_date contributes 0,
+-- the same treatment M1's decisions.md already documented for a
+-- still-running prior trial (see that entry for the residual limitation
+-- this doesn't eliminate).
 sponsor_history AS (
     SELECT
         t.nct_id,
         COUNT(hist.nct_id) AS sponsor_prior_trial_count,
         AVG(
-            CASE WHEN hist.overall_status IN ('TERMINATED', 'WITHDRAWN', 'SUSPENDED')
-                 THEN 1.0 ELSE 0.0 END
+            CASE
+                WHEN hr.resolved_completion_date IS NOT NULL
+                     AND hr.resolved_completion_date < t.start_date
+                     AND hist.overall_status IN ('TERMINATED', 'WITHDRAWN', 'SUSPENDED')
+                THEN 1.0
+                ELSE 0.0
+            END
         ) AS sponsor_prior_termination_rate
     FROM base t
     LEFT JOIN marts.fct_trials hist
         ON hist.sponsor_key = t.sponsor_key
         AND hist.start_date < t.start_date
+    LEFT JOIN hist_resolution hr ON hr.nct_id = hist.nct_id
     GROUP BY t.nct_id
 ),
 -- Point-in-time condition rarity, computed on each trial's PRIMARY (tie-broken)
@@ -196,7 +227,12 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         exactly one place. M9-1: also owns the decision to exclude
         enrollment_count -- the point-in-time joins guard row placement, but
         feature *semantics* ("is this value knowable at start_date?") is a
-        separate question this class is the only place to answer.
+        separate question this class is the only place to answer. M9-11:
+        sponsor_prior_termination_rate additionally requires a prior trial's
+        outcome to have an ACTUAL (not ESTIMATED) resolution date before this
+        trial's start_date, not merely a final status that happens to be
+        known today -- the same knowable-at-start_date semantics question
+        M9-1 raised, applied to a second feature.
     Failure mode: N/A (class-level).
     """
 
@@ -297,9 +333,11 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         df["has_results"] = df["has_results"].fillna(False)
         df["allocation"] = df["allocation"].fillna(policy["allocation"]["sentinel_value"])
         df["masking"] = df["masking"].fillna(policy["masking"]["sentinel_value"])
-        df["has_dmc_str"] = df["has_dmc"].map(
-            {True: "true", False: "false"}
-        ).fillna(policy["has_dmc"]["sentinel_value"])
+        df["has_dmc_str"] = (
+            df["has_dmc"]
+            .map({True: "true", False: "false"})
+            .fillna(policy["has_dmc"]["sentinel_value"])
+        )
 
         # --- Text-lite group ----------------------------------------------
         df["eligibility_criteria"] = df["eligibility_criteria"].fillna("")
@@ -314,7 +352,9 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         df["sponsor_class"] = df["sponsor_class"].fillna(policy["sponsor_class"]["sentinel_value"])
 
         # --- Condition group (raw; one-hot happens post-split) --------------
-        df["condition_name"] = df["condition_name"].fillna(policy["condition_name"]["sentinel_value"])
+        df["condition_name"] = df["condition_name"].fillna(
+            policy["condition_name"]["sentinel_value"]
+        )
         df["condition_rarity"] = df["condition_rarity"].fillna(0).astype(int)
 
         # --- Temporal group ---------------------------------------------
@@ -342,10 +382,7 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         top_n = self.config["condition_one_hot"]["top_n"]
         train_mask = df[split_col] == "train"
         top_conditions = (
-            df.loc[train_mask, "condition_name"]
-            .value_counts()
-            .head(top_n)
-            .index.tolist()
+            df.loc[train_mask, "condition_name"].value_counts().head(top_n).index.tolist()
         )
         bucketed = df["condition_name"].where(
             df["condition_name"].isin(top_conditions) | (df["condition_name"] == "unknown"),
@@ -439,7 +476,7 @@ def _count_exclusion_items(text_value: str) -> int:
     match = _EXCLUSION_HEADER_RE.search(text_value)
     if not match:
         return 0
-    tail = text_value[match.end():]
+    tail = text_value[match.end() :]
     return len(_BULLET_ITEM_RE.findall(tail))
 
 

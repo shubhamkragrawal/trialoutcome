@@ -226,7 +226,9 @@ def run_controlled_ablation(
     honest_cols_full = CATEGORICAL_FEATURES + NUMERIC_FEATURES + honest_cond_cols
     leaky_cols_full = CATEGORICAL_FEATURES + NUMERIC_FEATURES + leaky_cond_cols
 
-    honest_spw = float((honest_train_oh["label"] == 0).sum() / (honest_train_oh["label"] == 1).sum())
+    honest_spw = float(
+        (honest_train_oh["label"] == 0).sum() / (honest_train_oh["label"] == 1).sum()
+    )
     honest_pipe = build(honest_cond_cols, honest_spw)
     honest_pipe.fit(honest_train_oh[honest_cols_full], honest_train_oh["label"])
     honest_proba = honest_pipe.predict_proba(honest_test_oh[honest_cols_full])[:, 1]
@@ -244,7 +246,9 @@ def run_controlled_ablation(
     print(f"Fixed test window: {window_start.date()} to {window_end.date()}, n={len(fixed_test)}")
     print(f"Honest train (n={len(honest_train)}): PR-AUC={pr_honest:.4f}, ROC-AUC={roc_honest:.4f}")
     print(f"Leaky train  (n={len(leaky_train)}): PR-AUC={pr_leaky:.4f}, ROC-AUC={roc_leaky:.4f}")
-    print(f"Delta (leaky - honest): PR-AUC={pr_leaky - pr_honest:+.4f}, ROC-AUC={roc_leaky - roc_honest:+.4f}")
+    print(
+        f"Delta (leaky - honest): PR-AUC={pr_leaky - pr_honest:+.4f}, ROC-AUC={roc_leaky - roc_honest:+.4f}"
+    )
 
     with mlflow.start_run(run_name=f"controlled_ablation_{model_type}_best"):
         mlflow.set_tag("run_type", "controlled_ablation")
@@ -334,7 +338,9 @@ def main() -> None:
         )
         studies[model_type] = study
         print(f"{model_type} best val_pr_auc={study.best_value:.4f} params={study.best_params}")
-        print(f"{model_type} best trial pr_auc_temporal={study.best_trial.user_attrs['pr_auc_temporal']:.4f}")
+        print(
+            f"{model_type} best trial pr_auc_temporal={study.best_trial.user_attrs['pr_auc_temporal']:.4f}"
+        )
 
     for model_type in ["xgboost", "lgbm"]:
         run_controlled_ablation(

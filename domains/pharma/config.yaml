@@ -51,7 +51,7 @@ split:
 # --- Feature groups ----------------------------------------------------------
 # DECISION (2026-07-30, confirmed with user): live marts.fct_trials has
 # allocation, masking, has_dmc, and eligibility_criteria columns that the
-# original brief listed as unavailable (stale check). Only num_arms is
+# original requirements listed as unavailable (stale check). Only num_arms is
 # genuinely absent. These four are included as real features -- see
 # dropped_features below for the one column still missing.
 features:
@@ -172,43 +172,47 @@ missingness_policy:
 # below. Kept as a comment for provenance, not as a live value.
 #
 # --- M9 threshold decision ---------------------------------------------------
-# DECISION (M9-4, 2026-08-03): SELECTED ON CALIB (n=6,310), REPORTED ON TEST
-# (n=5,700). Swept against domains/pharma/cost_matrix.yaml's 5:1 FN:FP ratio
-# using the M9 no-enrollment model's isotonic-calibrated probabilities.
+# DECISION (M9-4, 2026-08-03, updated M9-11): SELECTED ON CALIB, REPORTED ON
+# TEST. Swept against domains/pharma/cost_matrix.yaml's 5:1 FN:FP ratio using
+# the M9-11 model's isotonic-calibrated probabilities (M9-11 rebuilt the
+# dataset with sponsor_prior_termination_rate's point-in-time fix and
+# retrained the champion again -- see decisions.md M9-11 -- so this threshold
+# moved a second time along with the model it's calibrated against).
 #
-# INSTABILITY FLAG -- READ BEFORE TRUSTING THIS NUMBER. The M9 fix plan said
-# that if the CALIB- and TEST-selected thresholds differ by more than ~0.05,
-# the operating point is unstable and needs a bootstrap CI rather than a point
-# estimate. They differ by 0.08 (CALIB 0.14 vs TEST 0.22), so that contingency
-# fired and the bootstrap was run:
-#   * 1,000-resample bootstrap of the CALIB selection: 95% CI = [0.10, 0.20],
-#     median 0.14. The interval is 0.10 wide -- half the useful range.
-#   * The cost surface is nearly flat across it: on TEST, cost at 0.14 is 3,130
-#     vs 3,019 at the TEST-optimal 0.22 -- 3.7% regret for doing this honestly.
-#   * That 3.7% IS the bias the old TEST-selected 0.22 was hiding.
-# The point estimate is therefore reported WITH its interval everywhere. A real
-# deployment would pick the operating point from the CI plus a capacity
-# constraint (how many trials can review actually absorb), not from argmin
-# alone.
+# INSTABILITY CHECK (re-run under M9-11): the M9 fix plan's ~0.05 stability
+# margin did NOT fire this time -- CALIB (0.16) and TEST-reference (0.21)
+# differ by exactly 0.05, which the same ">0.05" rule that fired under M9-4
+# (CALIB 0.14 vs TEST 0.22, |diff|=0.08) classifies as stable here. The
+# bootstrap was still run for continuity with M9-4's own reporting discipline
+# (report the interval regardless, not just when the contingency fires):
+#   * 1,000-resample bootstrap of the CALIB selection: 95% CI = [0.13, 0.21],
+#     median 0.16. TEST-reference (0.21) now falls INSIDE this CI -- under
+#     M9-4 it fell outside [0.10, 0.20].
+#   * Regret from selecting honestly (CALIB) vs the unattainable TEST-optimal
+#     (0.21): cost 3,326 vs 3,235 on TEST -- 2.8%, down from M9-4's 3.7%.
+# Interpretation: the M9-11 sponsor-history fix didn't just change the
+# feature's values, it also made the CALIB- and TEST-split cost surfaces
+# agree more closely -- consistent with removing a source of noise
+# (future-known status leaking into a feature) rather than adding one.
 #
-# OPERATIONAL CAVEAT: at 0.14 the model flags 70.5% of trials that actually
-# complete. That is what a 5:1 FN:FP matrix asks for once the leaked feature is
-# gone and the model is genuinely weaker -- it is a triage filter, not an
-# automated decision gate. Named here rather than buried.
+# OPERATIONAL CAVEAT: at 0.16 the model flags 72.9% of trials that actually
+# complete. That is what a 5:1 FN:FP matrix asks for given this model's
+# current discriminative power -- it is a triage filter, not an automated
+# decision gate. Named here rather than buried.
 model:
   threshold_decision:
-    value: 0.14
+    value: 0.16
     method: cost_optimal
     selected_on: calib          # M9-4: the fit split
     reported_on: test           # M9-4: the evaluation split
-    bootstrap_ci_95: [0.10, 0.20]   # 1,000 resamples of the CALIB selection
-    test_would_have_selected: 0.22  # reference only -- NOT used, this is the biased choice
-    regret_vs_test_optimal_pct: 3.7
-    expected_cost_at_threshold: 3130.0   # FN_count*5 + FP_count*1, TEST split (n=5700)
-    recall_at_threshold: 0.957   # catches 95.7% of trials that actually terminate
-    fp_rate_at_threshold: 0.705  # 70.5% false-positive rate among trials that actually complete
-    precision_at_threshold: 0.386
-    f1_at_threshold: 0.550
+    bootstrap_ci_95: [0.13, 0.21]   # 1,000 resamples of the CALIB selection (M9-11)
+    test_would_have_selected: 0.21  # reference only -- NOT used, this is the biased choice
+    regret_vs_test_optimal_pct: 2.8
+    expected_cost_at_threshold: 3326.0   # FN_count*5 + FP_count*1, TEST split (n=5789)
+    recall_at_threshold: 0.952   # catches 95.2% of trials that actually terminate
+    fp_rate_at_threshold: 0.729  # 72.9% false-positive rate among trials that actually complete
+    precision_at_threshold: 0.375
+    f1_at_threshold: 0.538
     calibration_method: isotonic
     computed_in: notebooks/03_calibration.ipynb
 
@@ -216,7 +220,7 @@ model:
 # DECISION (2026-08-02): reference = ml.training_dataset WHERE split='train'
 # (the population the Production model was actually trained on); current =
 # WHERE split='test' -- a PROXY for "last week's newly-scored trials" per the
-# M6 brief, since no live scoring traffic exists yet (the API has never been
+# M6 requirements, since no live scoring traffic exists yet (the API has never been
 # called in production). Documented honestly in domains/pharma/monitoring/drift_job.py,
 # notebooks/06_drift_report.ipynb, and README.md rather than presented as real
 # production monitoring data.
