@@ -164,8 +164,18 @@ def feature_pipeline_version() -> str:
         silent-feature-drift incident waiting to happen.
     """
     try:
+        # NOTE (M5 bugfix): `git rev-parse HEAD -- <path>` does NOT filter by
+        # path -- rev-parse's job is argument disambiguation, so it just
+        # echoes the path back as a second/third output line ("HEAD's hash",
+        # "--", "<path>") rather than restricting the hash to the last commit
+        # that touched <path>. That polluted every tag this function set with
+        # trailing "--\n<path>" garbage the moment the repo had a real commit
+        # (silent while the repo had zero commits, since the fallback
+        # "unknown" masked it). `git rev-list -1 HEAD -- <path>` is the
+        # correct incantation for "the hash of the last commit touching this
+        # path".
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD", "--", str(Path(__file__).relative_to(REPO_ROOT))],
+            ["git", "rev-list", "-1", "HEAD", "--", str(Path(__file__).relative_to(REPO_ROOT))],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
