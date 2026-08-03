@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -83,14 +84,27 @@ class TemporalDatasetBuilder(ABC):
             future outcomes (e.g. future sponsor termination rates) during
             training, inflating validation metrics in a way that will not
             hold in production, where the future is genuinely unknown.
-        Failure mode: If date_col contains nulls or out-of-range values, those
-            rows get miscategorized silently (pandas comparisons against NaT
-            return False, so null-dated rows fall through to whatever the
-            last branch is) -- callers must filter implausible dates before
-            calling this.
+        Failure mode: Raises ValueError if date_col contains any null (NaT)
+            values, rather than silently routing them into a split. Pandas
+            comparisons against NaT are always False, so a naive
+            np.select(..., default=...) would route every null-dated row into
+            whichever split the default names -- previously "test", meaning a
+            stale or partially-built cache with unfiltered nulls would leak
+            unknown-date rows into evaluation without any error. The
+            production SQL path (domains/pharma/dataset_builder.py's raw
+            query) already filters nulls via start_date_min/max; this guard
+            exists for the cached-parquet path, where that filtering SQL
+            never runs.
         """
         out = df.copy()
         dates = pd.to_datetime(out[date_col])
+        if dates.isna().any():
+            n_null = int(dates.isna().sum())
+            raise ValueError(
+                f"temporal_split: {n_null} row(s) have a null {date_col!r}; "
+                "filter implausible/missing dates before calling temporal_split "
+                "(a stale cache is a common cause -- rebuild with use_cache=False)."
+            )
         conditions = [
             dates < split_dates.train_end,
             (dates >= split_dates.train_end) & (dates < split_dates.calib_end),
@@ -219,11 +233,15 @@ class TemporalDatasetBuilder(ABC):
             """
         )
         with engine.begin() as conn:
-            conn.execute(insert_sql, records.to_dict(orient="records"))
+            # to_dict(orient="records") is typed list[dict[Hashable, Any]] by
+            # the pandas stubs (Hashable, since DataFrame columns can in
+            # general be any hashable) -- the rename() above guarantees these
+            # keys are actually the fixed str column names SQLAlchemy expects.
+            conn.execute(insert_sql, cast(list[dict[str, Any]], records.to_dict(orient="records")))
         return len(records)
 
 
-def _json_default(value):
+def _json_default(value: Any) -> Any:
     """
     Purpose: Make numpy scalar types (int64, float64, bool_) JSON-serializable
         when features are dumped to JSONB.
