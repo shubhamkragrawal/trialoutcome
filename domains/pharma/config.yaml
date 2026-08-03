@@ -136,3 +136,36 @@ missingness_policy:
     sentinel_value: unknown
   phase:
     strategy: drop_row           # phase is the primary filter -- NULL phase is unclassifiable
+
+# --- M3 threshold decision --------------------------------------------------
+# DECISION (2026-07-30, confirmed with user): cost-optimal threshold, chosen by
+# sweeping domains/pharma/cost_matrix.yaml's 5:1 FN:FP cost ratio against the
+# TEST split's ISOTONIC-CALIBRATED probabilities (calibrator fit on CALIB per
+# notebooks/03_calibration.ipynb, chosen over Platt scaling by lower ECE:
+# 0.0000 vs 0.0405 on CALIB, confirmed 0.0238 vs raw 0.1897 on held-out TEST).
+# Not written by the notebook itself -- computed there, then added here by
+# hand, to avoid a machine-written yaml.safe_dump stripping this file's
+# hand-authored comments.
+model:
+  threshold_decision:
+    value: 0.22
+    method: cost_optimal      # vs f1_max=0.37 (cost 2508) and default=0.5 (cost 3081)
+    expected_cost_at_threshold: 2044.0   # FN_count*5 + FP_count*1, TEST split (n=5700)
+    recall_at_threshold: 0.880   # catches 88.0% of trials that actually terminate
+    fp_rate_at_threshold: 0.246  # 24.6% false-positive rate among trials that actually complete
+    calibration_method: isotonic
+    computed_in: notebooks/03_calibration.ipynb
+
+# --- M6 drift monitoring ------------------------------------------------------
+# DECISION (2026-08-02): reference = ml.training_dataset WHERE split='train'
+# (the population the Production model was actually trained on); current =
+# WHERE split='test' -- a PROXY for "last week's newly-scored trials" per the
+# M6 brief, since no live scoring traffic exists yet (the API has never been
+# called in production). Documented honestly in domains/pharma/monitoring/drift_job.py,
+# notebooks/06_drift_report.ipynb, and README.md rather than presented as real
+# production monitoring data.
+drift:
+  reference_split: train
+  current_split: test
+  feature_drift_threshold: 0.5   # fraction of features drifted = alert
+  dataset_drift: true            # use Evidently's dataset-level drift flag (DriftedColumnsCount share vs feature_drift_threshold above)
