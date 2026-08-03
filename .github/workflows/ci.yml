@@ -171,4 +171,5 @@ jobs:
         run: make db-init
 
       - name: Run M7 retrain-trigger / version-mismatch / rollback tests
-        run: uv run pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py tests/test_rollback.py -v
+
+        run: pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py tests/test_rollback.py -v
