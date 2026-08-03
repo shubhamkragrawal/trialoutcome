@@ -31,12 +31,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run unit tests
-        # tests/test_api_contract.py is excluded: it's an integration suite
-        # that requires the FastAPI service already running inside a live
-        # Docker container (`make serve` + `make test-api`), which this job
-        # does not stand up. Everything else under tests/ is a fast,
-        # DB-free unit test.
-        run: pytest tests/ -v --ignore=tests/test_api_contract.py
+        run: uv run pytest tests/ -v --ignore=tests/test_api_contract.py
 
   drift-check:
     runs-on: ubuntu-latest
