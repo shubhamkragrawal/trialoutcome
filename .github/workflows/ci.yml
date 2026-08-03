@@ -31,7 +31,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run unit tests
-        run: uv run pytest tests/ -v --ignore=tests/test_api_contract.py
+        run: pytest tests/ -v --ignore=tests/test_api_contract.py
 
   drift-check:
     runs-on: ubuntu-latest
