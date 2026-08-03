@@ -6,7 +6,11 @@ CONTRACT /predict routes on top of core/serving/api_base.py's generic shell.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,12 +19,13 @@ import mlflow
 import numpy as np
 import pandas as pd
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from core.explain import SHAPExplainer
 from core.serving.api_base import (
+    CoverageGuarantee,
     PredictionResponse,
     ServingState,
     SHAPContributor,
@@ -32,6 +37,27 @@ from domains.pharma.train_pipeline import CATEGORICAL_FEATURES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REGISTERED_MODEL_NAME = "trialoutcome_xgb_calibrated"
+
+# M9-7: idempotent create so /predict's background write works even on an
+# environment where db-init hasn't been re-run since ml.prediction_log was
+# added -- identical pattern to drift_job.py's _CREATE_DRIFT_LOG_SQL.
+_CREATE_PREDICTION_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS ml.prediction_log (
+    id BIGSERIAL PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    nct_id TEXT,
+    proba NUMERIC(6,5) NOT NULL,
+    threshold_decision TEXT NOT NULL,
+    feature_pipeline_version TEXT NOT NULL,
+    model_version INT NOT NULL,
+    features_hash TEXT NOT NULL,
+    conformal_low NUMERIC(6,5),
+    conformal_high NUMERIC(6,5),
+    top_shap_feature TEXT,
+    latency_ms INT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+"""
 
 
 class TrialFeatures(BaseModel):
@@ -105,6 +131,8 @@ class _PharmaModelBundle:
     ece: float
     model_version: str
     db_engine: object
+    imputation_constants: dict[str, float]
+    empirical_coverage: float
     extras: dict = field(default_factory=dict)
 
 
@@ -134,6 +162,13 @@ def _load_bundle() -> _PharmaModelBundle:
 
     feature_schema = mlflow.artifacts.load_dict(f"runs:/{mv.run_id}/feature_schema.json")
     condition_vocab = mlflow.artifacts.load_dict(f"runs:/{mv.run_id}/condition_vocab.json")
+    # M9-8: frozen at training time (build_features()'s exact medians -- see
+    # PharmaDatasetBuilder.compute_imputation_constants) and loaded here, not
+    # recomputed from a single-row request at serving time. See
+    # _row_from_trial_features's use of this below.
+    imputation_constants = mlflow.artifacts.load_dict(
+        f"runs:/{mv.run_id}/imputation_constants.json"
+    )
 
     # Unwrap CalibratedClassifierCV(estimator=FrozenEstimator(xgb_pipeline))
     # to get back the raw fitted Pipeline([("pre", ColumnTransformer), ("clf",
@@ -162,6 +197,12 @@ def _load_bundle() -> _PharmaModelBundle:
         ece=run.data.metrics.get("ece_test", float("nan")),
         model_version=mv.version,
         db_engine=builder.engine,
+        imputation_constants=imputation_constants,
+        # M9-9: loaded once at startup (not recomputed per-request) so
+        # coverage_guarantee.empirical reflects the TEST-split verification
+        # MAPIEConformalWrapper.verify_coverage() actually measured for THIS
+        # run, not a value hardcoded in the API layer.
+        empirical_coverage=run.data.metrics.get("empirical_coverage", float("nan")),
     )
 
 
@@ -179,6 +220,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TrialOutcome API", lifespan=lifespan)
 app.include_router(build_base_router(state))
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """
+    Purpose: Tag every request with a uuid4 request_id (M9-7), used to
+        correlate a served prediction with its ml.prediction_log row.
+    Leakage guard: N/A.
+    Failure mode: N/A -- request.state is per-request; nothing here can leak
+        across concurrent requests.
+    """
+    request.state.request_id = str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
 
 
 def _require_bundle() -> _PharmaModelBundle:
@@ -201,11 +257,12 @@ def _row_from_trial_features(trial: TrialFeatures, b: _PharmaModelBundle) -> pd.
     Purpose: Turn a raw TrialFeatures request body into the one-hot-expanded
         feature row the Production pipeline expects.
     Leakage guard: N/A -- inference only.
-    Failure mode (documented limitation): `sponsor_prior_termination_rate=None`
-        defaults to 0.0 rather than the
-        TRAIN-split median `config.yaml`'s missingness_policy specifies --
-        replicating that exact median in live serving would require
-        persisting it as a training-time artifact, deferred past M5's acceptance criteria.
+    Failure mode: `sponsor_prior_termination_rate=None` is filled with
+        `b.imputation_constants["sponsor_prior_termination_rate"]` -- the
+        actual median build_features() computed and imputed with at training
+        time (frozen and loaded in _load_bundle(), see M9-8), not a fresh
+        "median" of this single-row request (meaningless for n=1) and not the
+        pre-M9-8 hardcoded 0.0.
     """
     has_dmc_str = "unknown" if trial.has_dmc is None else ("true" if trial.has_dmc else "false")
     bucket = _condition_bucket(trial.condition_name, b.top_conditions)
@@ -226,7 +283,7 @@ def _row_from_trial_features(trial: TrialFeatures, b: _PharmaModelBundle) -> pd.
         "sponsor_prior_trial_count": trial.sponsor_prior_trial_count,
         "sponsor_prior_termination_rate": trial.sponsor_prior_termination_rate
         if trial.sponsor_prior_termination_rate is not None
-        else 0.0,
+        else b.imputation_constants["sponsor_prior_termination_rate"],
         "condition_rarity": trial.condition_rarity,
         "start_year": trial.start_year,
         "start_quarter": trial.start_quarter,
@@ -310,12 +367,79 @@ def _to_native(value):
     return value.item() if hasattr(value, "item") else value
 
 
+def _features_hash(row_df: pd.DataFrame, b: _PharmaModelBundle) -> str:
+    """Deterministic sha256 of the exact feature row scored, for
+    ml.prediction_log dedup/audit (M9-7) -- not the full row is logged, only
+    its hash, so this is what lets two requests be recognized as scoring
+    identical inputs without persisting the full feature vector per row."""
+    payload = {col: _to_native(row_df.iloc[0][col]) for col in b.feature_cols}
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _log_prediction_background(
+    b: _PharmaModelBundle,
+    request_id: str,
+    nct_id: str | None,
+    response: PredictionResponse,
+    row_df: pd.DataFrame,
+    latency_ms: int,
+) -> None:
+    """
+    Purpose: Best-effort write of one served prediction to ml.prediction_log
+        (M9-7), run as a FastAPI BackgroundTask so it adds zero latency to
+        the response actually returned to the caller.
+    Leakage guard: N/A -- write-only logging of an already-computed response.
+    Failure mode (by design, not a gap): any exception here (DB unreachable,
+        schema not yet migrated, etc.) is caught and printed to stdout, never
+        re-raised -- a client must always get their prediction even if the
+        prediction-log database is down. This is the deliberate opposite of
+        _require_bundle()'s fail-loud contract: serving must not degrade,
+        logging is allowed to.
+    """
+    try:
+        with b.db_engine.begin() as conn:
+            conn.execute(text(_CREATE_PREDICTION_LOG_SQL))
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO ml.prediction_log
+                        (request_id, nct_id, proba, threshold_decision,
+                         feature_pipeline_version, model_version, features_hash,
+                         conformal_low, conformal_high, top_shap_feature, latency_ms)
+                    VALUES
+                        (:request_id, :nct_id, :proba, :threshold_decision,
+                         :feature_pipeline_version, :model_version, :features_hash,
+                         :conformal_low, :conformal_high, :top_shap_feature, :latency_ms)
+                    """
+                ),
+                {
+                    "request_id": request_id,
+                    "nct_id": nct_id,
+                    "proba": response.proba,
+                    "threshold_decision": response.threshold_decision,
+                    "feature_pipeline_version": response.feature_pipeline_version,
+                    "model_version": int(b.model_version),
+                    "features_hash": _features_hash(row_df, b),
+                    # ml.prediction_log's columns are conformal_low/conformal_high
+                    # (unchanged, not part of the M9-9 API rename -- these are
+                    # internal DB column names, not the locked HTTP contract).
+                    "conformal_low": response.uncertainty_band[0],
+                    "conformal_high": response.uncertainty_band[1],
+                    "top_shap_feature": response.top_shap[0].feature if response.top_shap else None,
+                    "latency_ms": latency_ms,
+                },
+            )
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        print(f"[prediction_log] write failed (request_id={request_id}): {exc}")
+
+
 def _predict_from_row(row_df: pd.DataFrame, b: _PharmaModelBundle) -> PredictionResponse:
     proba_arr = b.calibrated_model.predict_proba(row_df[b.feature_cols])[:, 1]
     proba = float(proba_arr[0])
 
     _, intervals = b.conformal_wrapper.predict_with_interval(row_df[b.feature_cols])
-    conformal_interval = intervals[0]
+    uncertainty_band = intervals[0]
 
     threshold_decision = "high_risk" if proba >= b.threshold else "low_risk"
     top_shap = _top_shap_contributors(row_df, b, top_n=5)
@@ -323,7 +447,13 @@ def _predict_from_row(row_df: pd.DataFrame, b: _PharmaModelBundle) -> Prediction
 
     return PredictionResponse(
         proba=proba,
-        conformal_interval=conformal_interval,
+        uncertainty_band=uncertainty_band,
+        coverage_guarantee=CoverageGuarantee(
+            type="label_set",
+            target=b.conformal_wrapper.target_coverage,
+            empirical=b.empirical_coverage,
+            note=("Guarantee is on set membership of the true label, not on the probability band."),
+        ),
         threshold_decision=threshold_decision,
         top_shap=[SHAPContributor(**c) for c in top_shap],
         plain_english_summary=summary,
@@ -344,16 +474,32 @@ def model_info() -> ModelInfoResponse:
 
 
 @app.post("/api/v1/predict", response_model=PredictionResponse)
-def predict(trial: TrialFeatures) -> PredictionResponse:
+def predict(
+    trial: TrialFeatures, request: Request, background_tasks: BackgroundTasks
+) -> PredictionResponse:
     b = _require_bundle()
+    start = time.perf_counter()
     row_df = _row_from_trial_features(trial, b)
-    return _predict_from_row(row_df, b)
+    response = _predict_from_row(row_df, b)
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    background_tasks.add_task(
+        _log_prediction_background,
+        b,
+        request.state.request_id,
+        None,
+        response,
+        row_df,
+        latency_ms,
+    )
+    return response
 
 
 @app.api_route(
     "/api/v1/predict/nct/{nct_id}", methods=["GET", "POST"], response_model=PredictionResponse
 )
-def predict_by_nct_id(nct_id: str) -> PredictionResponse:
+def predict_by_nct_id(
+    nct_id: str, request: Request, background_tasks: BackgroundTasks
+) -> PredictionResponse:
     """
     NOTE: the M5 spec text lists this route as POST-only, but its own
     tests/test_api_contract.py calls it with `requests.get(...)` -- an
@@ -363,6 +509,7 @@ def predict_by_nct_id(nct_id: str) -> PredictionResponse:
     literal test file passes and the documented contract (POST) still works.
     """
     b = _require_bundle()
+    start = time.perf_counter()
     with b.db_engine.connect() as conn:
         row = conn.execute(
             text("SELECT features FROM ml.training_dataset WHERE nct_id = :nct_id"),
@@ -374,4 +521,15 @@ def predict_by_nct_id(nct_id: str) -> PredictionResponse:
         )
 
     row_df = _row_from_jsonb(row[0], b)
-    return _predict_from_row(row_df, b)
+    response = _predict_from_row(row_df, b)
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    background_tasks.add_task(
+        _log_prediction_background,
+        b,
+        request.state.request_id,
+        nct_id,
+        response,
+        row_df,
+        latency_ms,
+    )
+    return response

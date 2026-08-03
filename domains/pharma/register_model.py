@@ -80,6 +80,7 @@ PRE_M9_LEAKED_PR_AUC_TEMPORAL = 0.8877613220680413  # pre-M9-1 (enrollment leak)
 def main() -> None:
     builder = PharmaDatasetBuilder()
     raw = builder.fetch_raw()
+    imputation_constants = builder.compute_imputation_constants(raw)
     feat = builder.build_features(raw)
 
     split_cfg = builder.config["split"]
@@ -169,6 +170,12 @@ def main() -> None:
             {"condition_cols": condition_cols, "top_conditions": top_conditions},
             "condition_vocab.json",
         )
+        # M9-8: freeze the exact imputation medians build_features() used, so
+        # serving loads THIS run's frozen values instead of recomputing a
+        # "median" from a single-row request (which is meaningless for n=1
+        # and was previously hardcoded to 0.0 for sponsor_prior_termination_rate
+        # -- see api.py's _row_from_trial_features and decisions.md M9-8).
+        mlflow.log_dict(imputation_constants, "imputation_constants.json")
         mlflow.log_dict(
             {
                 "categorical_features": CATEGORICAL_FEATURES,

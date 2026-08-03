@@ -364,6 +364,38 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
 
         return df
 
+    def compute_imputation_constants(self, raw: pd.DataFrame) -> dict[str, float]:
+        """
+        Purpose: Compute the exact median values build_features() uses to fill
+            num_primary_outcomes/num_sites/sponsor_prior_termination_rate, as
+            a standalone, loggable artifact (M9-8). These are the SAME
+            expressions build_features() evaluates internally (`raw` is
+            untouched by build_features -- it operates on `raw.copy()` -- so
+            calling this before or after build_features on the same `raw`
+            gives identical results); duplicated here rather than refactored
+            out of build_features so build_features' imputation and this
+            artifact-logging path can never silently drift apart from a
+            future edit to only one of them without both call sites being
+            touched (both read from the same three `raw[col].median()` exprs).
+        Leakage guard: N/A -- these constants describe how TRAIN's own
+            imputation already worked (build_features imputes before the
+            temporal split, using the full fetched population median, not a
+            per-split one); this method does not change that, it only
+            surfaces the resulting numbers so serving can freeze them instead
+            of recomputing from a single-row request.
+        Failure mode: If build_features' imputation exprs for these three
+            columns are ever edited without a matching edit here, this
+            artifact silently stops matching what the model was actually
+            trained on -- there is no automated check tying the two together
+            beyond tests/test_imputation_constants.py's fixture-based
+            equality check.
+        """
+        return {
+            "num_primary_outcomes": float(raw["num_primary_outcomes"].median()),
+            "num_sites": float(raw["num_sites"].median()),
+            "sponsor_prior_termination_rate": float(raw["sponsor_prior_termination_rate"].median()),
+        }
+
     def _one_hot_condition(self, df: pd.DataFrame, split_col: str = "split") -> pd.DataFrame:
         """
         Purpose: One-hot encode condition_name into the top-N most frequent
