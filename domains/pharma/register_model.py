@@ -11,7 +11,6 @@ hyperparameters procedure M3/M4 already validated (assert PR-AUC matches to
 
 from __future__ import annotations
 
-import json
 from datetime import date
 
 import mlflow
@@ -37,10 +36,12 @@ from domains.pharma.train_pipeline import (
 
 EXPERIMENT_NAME = "trialoutcome_m2"
 REGISTERED_MODEL_NAME = "trialoutcome_xgb_calibrated"
-# M9-4: CALIB-selected (was 0.22, TEST-selected). config.yaml's
-# model.threshold_decision is the source of truth the API reads at load time;
-# this constant only feeds the logged MLflow param. Keep them in sync.
-THRESHOLD = 0.14
+# M9-4: CALIB-selected (was 0.22, TEST-selected). M9-11: moved again to 0.16
+# after the sponsor-history point-in-time fix changed both the model and its
+# calibrated probabilities. config.yaml's model.threshold_decision is the
+# source of truth the API reads at load time; this constant only feeds the
+# logged MLflow param. Keep them in sync.
+THRESHOLD = 0.16
 
 # Logged hyperparams for MLflow run c4a4d0300bd949f8bb07b7c48417be4d (M2 XGBoost
 # champion, CV-selected). Reproduced exactly here per decisions.md's M3 refit
@@ -51,26 +52,27 @@ THRESHOLD = 0.14
 # delta isolates the feature change rather than confounding it with a new
 # search). The M2 run itself was trained WITH the leaked enrollment features,
 # so this refit no longer reproduces c4a4d030's 0.8877613220680413.
-XGBOOST_BEST_PARAMS = dict(
-    n_estimators=452,
-    max_depth=3,
-    learning_rate=0.03442632871923141,
-    subsample=0.6455669343594874,
-    colsample_bytree=0.7423738358796874,
-    min_child_weight=3,
-)
+XGBOOST_BEST_PARAMS = {
+    "n_estimators": 452,
+    "max_depth": 3,
+    "learning_rate": 0.03442632871923141,
+    "subsample": 0.6455669343594874,
+    "colsample_bytree": 0.7423738358796874,
+    "min_child_weight": 3,
+}
 XGBOOST_BEST_RUN_ID = "c4a4d0300bd949f8bb07b7c48417be4d"
 
-# M9-1 RE-BASELINE. Was 0.8877613220680413 (the leaked M2 champion). The
-# assertion below is a feature-pipeline-drift tripwire, not a claim that this
-# refit reproduces an M2 run -- it cannot, since M2's feature set included
-# log_enrollment_count/enrollment_missing. Re-baselined against the M9
-# no-enrollment retrain on the same temporal split and condition vocabulary.
-# If this assertion fires, the feature pipeline moved: diff
-# dataset_builder.feature_columns() and train_pipeline.NUMERIC_FEATURES
-# against decisions.md M9-1 before changing this number.
-EXPECTED_PR_AUC_TEMPORAL = 0.6483783386043787
-PRE_M9_LEAKED_PR_AUC_TEMPORAL = 0.8877613220680413  # kept for the README's before/after table
+# M9-11 RE-BASELINE. Was 0.6483783386043787 (M9-1's no-enrollment baseline).
+# The assertion below is a feature-pipeline-drift tripwire, not a claim this
+# refit reproduces an earlier run exactly -- it cannot, since M9-11 changed
+# sponsor_prior_termination_rate's *values* (point-in-time resolution-date
+# fix; same feature list as M9-1, different numbers -- see decisions.md
+# M9-11). If this assertion fires, the feature pipeline moved again: diff
+# dataset_builder.feature_columns()/train_pipeline.NUMERIC_FEATURES against
+# decisions.md M9-11 before changing this number.
+EXPECTED_PR_AUC_TEMPORAL = 0.6192941645955544
+PRE_M9_11_PR_AUC_TEMPORAL = 0.6483783386043787  # M9-1 baseline, kept for the README's before/after table
+PRE_M9_LEAKED_PR_AUC_TEMPORAL = 0.8877613220680413  # pre-M9-1 (enrollment leak), same table
 
 
 def main() -> None:
@@ -80,7 +82,8 @@ def main() -> None:
 
     split_cfg = builder.config["split"]
     dates = SplitDates(
-        train_end=pd.Timestamp(split_cfg["train_end"]), calib_end=pd.Timestamp(split_cfg["calib_end"])
+        train_end=pd.Timestamp(split_cfg["train_end"]),
+        calib_end=pd.Timestamp(split_cfg["calib_end"]),
     )
     temporal = builder.temporal_split(feat, date_col="start_date", split_dates=dates)
 
@@ -109,7 +112,9 @@ def main() -> None:
     proba_test_raw = xgb_pipeline.predict_proba(test[feature_cols])[:, 1]
     pr_check = float(average_precision_score(test["label"], proba_test_raw))
     roc_check = float(roc_auc_score(test["label"], proba_test_raw))
-    print(f"Refit sanity check -- pr_auc_temporal={pr_check:.6f} (expected {EXPECTED_PR_AUC_TEMPORAL:.6f})")
+    print(
+        f"Refit sanity check -- pr_auc_temporal={pr_check:.6f} (expected {EXPECTED_PR_AUC_TEMPORAL:.6f})"
+    )
     assert abs(pr_check - EXPECTED_PR_AUC_TEMPORAL) < 1e-6, (
         f"refit pr_auc_temporal={pr_check:.6f} != M9 baseline "
         f"{EXPECTED_PR_AUC_TEMPORAL:.6f} -- the feature pipeline drifted. Do not "
@@ -119,7 +124,7 @@ def main() -> None:
     print("Refit reproduces the M9 no-enrollment baseline exactly.")
 
     # --- Wrap the already-fitted pipeline with sklearn's CalibratedClassifierCV
-    # in isotonic mode, fit on CALIB only. NOTE (deviation from the M5 prompt's
+    # in isotonic mode, fit on CALIB only. NOTE (deviation from the M5 spec's
     # literal snippet): sklearn 1.9 removed `cv="prefit"` and renamed
     # `base_estimator` -> `estimator` (see decisions.md M5 entry) -- an
     # already-fitted estimator must instead be wrapped in
@@ -158,7 +163,10 @@ def main() -> None:
         mlflow.log_metric("pr_auc_temporal", pr_auc_calibrated)
         mlflow.log_metric("roc_auc_temporal", roc_check)
 
-        mlflow.log_dict({"condition_cols": condition_cols, "top_conditions": top_conditions}, "condition_vocab.json")
+        mlflow.log_dict(
+            {"condition_cols": condition_cols, "top_conditions": top_conditions},
+            "condition_vocab.json",
+        )
         mlflow.log_dict(
             {
                 "categorical_features": CATEGORICAL_FEATURES,

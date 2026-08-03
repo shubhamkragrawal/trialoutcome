@@ -6,9 +6,12 @@ layer built on top of this module's output.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import shap
+from numpy.typing import ArrayLike
 
 
 class SHAPExplainer:
@@ -25,7 +28,7 @@ class SHAPExplainer:
     Failure mode: N/A (class-level).
     """
 
-    def __init__(self, model, X_background: pd.DataFrame | None = None):
+    def __init__(self, model: Any, X_background: pd.DataFrame | None = None):
         """
         Purpose: Build the appropriate SHAP explainer for `model`'s type at
             construction time (not lazily), so a caller finds out
@@ -98,7 +101,7 @@ class SHAPExplainer:
 
     def local_explanation(
         self, shap_values: np.ndarray, X: pd.DataFrame, idx: int, top_n: int = 5
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """
         Purpose: Return the top-`top_n` SHAP contributors for one row
             (X.iloc[idx]), each as {feature, value, shap_contribution},
@@ -124,7 +127,7 @@ class SHAPExplainer:
     def worst_false_negatives(
         self,
         X_test: pd.DataFrame,
-        y_test,
+        y_test: ArrayLike,
         y_proba: np.ndarray,
         threshold: float,
         n: int = 20,

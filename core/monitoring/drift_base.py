@@ -70,12 +70,12 @@ class DriftMonitorBase(ABC):
             means (real live traffic vs. a proxy) is the subclass's
             responsibility to document, not this base class's.
 
-        NOTE: not one of the four method names the M6 brief listed
+        NOTE: not one of the four method names the M6 requirements listed
         (load_reference/score_batch/generate_report/check_thresholds) --
         added because score_batch() needs two DataFrames to compare and a
         base class has no legitimate way to guess where a domain's "current
         batch" data lives. Flagged here rather than silently expanding the
-        brief's method list without saying so.
+        requirements' method list without saying so.
         """
         raise NotImplementedError
 

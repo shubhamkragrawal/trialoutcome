@@ -114,12 +114,16 @@ def _latest_drift_row(engine) -> dict | None:
         -- the caller treats "no drift history" the same as "not drifted".
     """
     with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT drift_share, n_features_drifted, drifted, report_path, model_version "
-                "FROM ml.drift_log ORDER BY id DESC LIMIT 1"
+        row = (
+            conn.execute(
+                text(
+                    "SELECT drift_share, n_features_drifted, drifted, report_path, model_version "
+                    "FROM ml.drift_log ORDER BY id DESC LIMIT 1"
+                )
             )
-        ).mappings().first()
+            .mappings()
+            .first()
+        )
     return dict(row) if row else None
 
 
@@ -164,7 +168,8 @@ def _retrain_and_stage(builder: PharmaDatasetBuilder) -> tuple[str, str, str]:
 
     split_cfg = builder.config["split"]
     dates = SplitDates(
-        train_end=pd.Timestamp(split_cfg["train_end"]), calib_end=pd.Timestamp(split_cfg["calib_end"])
+        train_end=pd.Timestamp(split_cfg["train_end"]),
+        calib_end=pd.Timestamp(split_cfg["calib_end"]),
     )
     temporal = builder.temporal_split(feat, date_col="start_date", split_dates=dates)
 
@@ -322,7 +327,9 @@ def check_and_trigger_retrain(force: bool = False) -> dict | None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="M7 drift-triggered retrain check")
     parser.add_argument(
-        "--force", action="store_true", help="Retrain even if the latest drift check is clean (testing)"
+        "--force",
+        action="store_true",
+        help="Retrain even if the latest drift check is clean (testing)",
     )
     args = parser.parse_args()
     check_and_trigger_retrain(force=args.force)

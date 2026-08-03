@@ -5,7 +5,10 @@ concrete FN:FP ratio TrialOutcome sweeps against.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
+from numpy.typing import ArrayLike
 from sklearn.metrics import f1_score, precision_score, recall_score
 
 
@@ -36,12 +39,12 @@ class ThresholdSelector:
 
     def find_cost_optimal_threshold(
         self,
-        y_true,
-        y_proba,
+        y_true: ArrayLike,
+        y_proba: ArrayLike,
         fn_cost: float,
         fp_cost: float,
         step: float = 0.01,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
         Purpose: Sweep thresholds 0.01..0.99 in `step` increments; at each,
             compute expected_cost = FN_count*fn_cost + FP_count*fp_cost, and
@@ -74,13 +77,13 @@ class ThresholdSelector:
             fp = int(((y_true == 0) & (y_pred == 1)).sum())
             costs_by_threshold[float(t)] = float(fn * fn_cost + fp * fp_cost)
 
-        cost_optimal = min(costs_by_threshold, key=costs_by_threshold.get)
+        cost_optimal = min(costs_by_threshold, key=lambda t: costs_by_threshold[t])
 
-        f1_scores = {
+        f1_scores: dict[float, float] = {
             float(t): f1_score(y_true, (y_proba >= t).astype(int), zero_division=0)
             for t in thresholds
         }
-        f1_max = max(f1_scores, key=f1_scores.get)
+        f1_max = max(f1_scores, key=lambda t: f1_scores[t])
 
         default = 0.5
         if default not in costs_by_threshold:
@@ -100,8 +103,13 @@ class ThresholdSelector:
         }
 
     def metrics_at_threshold(
-        self, y_true, y_proba, threshold: float, fn_cost: float, fp_cost: float
-    ) -> dict:
+        self,
+        y_true: ArrayLike,
+        y_proba: ArrayLike,
+        threshold: float,
+        fn_cost: float,
+        fp_cost: float,
+    ) -> dict[str, float]:
         """
         Purpose: Compute precision/recall/f1/expected-cost at one specific
             threshold -- used to build a decision table across the three

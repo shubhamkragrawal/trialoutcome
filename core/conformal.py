@@ -5,8 +5,11 @@ notebooks/05_conformal.ipynb for the concrete TrialOutcome application.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
 
 
 class _NamedColumnEstimatorAdapter:
@@ -39,23 +42,23 @@ class _NamedColumnEstimatorAdapter:
         self-check.
     """
 
-    def __init__(self, estimator, template_row: pd.DataFrame):
+    def __init__(self, estimator: Any, template_row: pd.DataFrame):
         self.estimator = estimator
         self.columns = list(template_row.columns)
         self.template_row = template_row.iloc[[0]].copy()
         self.classes_ = estimator.classes_
         self.n_features_in_ = len(self.columns)
 
-    def _as_dataframe(self, X) -> pd.DataFrame:
+    def _as_dataframe(self, X: Any) -> pd.DataFrame:
         if isinstance(X, pd.DataFrame):
             return X
         n_rows = np.asarray(X).shape[0]
         return pd.concat([self.template_row] * n_rows, ignore_index=True)
 
-    def predict(self, X):
+    def predict(self, X: Any) -> Any:
         return self.estimator.predict(self._as_dataframe(X))
 
-    def predict_proba(self, X):
+    def predict_proba(self, X: Any) -> Any:
         return self.estimator.predict_proba(self._as_dataframe(X))
 
 
@@ -78,7 +81,7 @@ class MAPIEConformalWrapper:
         self.target_coverage = target_coverage
         self.calibrated_model_ = None
         self.mapie_ = None
-        # NOTE (design decision, prompt was ambiguous here): "margin = 1 -
+        # NOTE (design decision, spec was ambiguous here): "margin = 1 -
         # coverage_achieved" is interpreted as the *nominal* coverage this
         # wrapper was configured for (target_coverage), not the empirical
         # coverage measured by verify_coverage(). This is deliberate: margin
@@ -86,10 +89,12 @@ class MAPIEConformalWrapper:
         # where a TEST split isn't available -- it must be computable right
         # after fit_conformal(), not depend on a verify_coverage() call
         # happening first. verify_coverage()'s empirical number is reported
-        # separately for the M5 DoD gate, not fed back into the margin.
+        # separately for the M5 acceptance criteria gate, not fed back into the margin.
         self.margin_ = 1.0 - target_coverage
 
-    def fit_conformal(self, calibrated_model, X_calib: pd.DataFrame, y_calib) -> "MAPIEConformalWrapper":
+    def fit_conformal(
+        self, calibrated_model: Any, X_calib: pd.DataFrame, y_calib: ArrayLike
+    ) -> MAPIEConformalWrapper:
         """
         Purpose: Fit MAPIE's conformalization step on the CALIB split, using
             an already-fitted (and already probability-calibrated) model as
@@ -106,16 +111,19 @@ class MAPIEConformalWrapper:
 
         self.calibrated_model_ = calibrated_model
         adapter = _NamedColumnEstimatorAdapter(calibrated_model, template_row=X_calib)
-        self.mapie_ = SplitConformalClassifier(
+        mapie = SplitConformalClassifier(
             estimator=adapter,
             confidence_level=self.target_coverage,
             conformity_score="lac",
             prefit=True,
         )
-        self.mapie_.conformalize(X_calib, y_calib)
+        mapie.conformalize(X_calib, y_calib)
+        self.mapie_ = mapie
         return self
 
-    def predict_with_interval(self, X: pd.DataFrame) -> tuple[np.ndarray, list[tuple[float, float]]]:
+    def predict_with_interval(
+        self, X: pd.DataFrame
+    ) -> tuple[np.ndarray, list[tuple[float, float]]]:
         """
         Purpose: Return (proba, interval) for each row in X.
             proba = calibrated_model_.predict_proba(X)[:, 1].
@@ -137,7 +145,9 @@ class MAPIEConformalWrapper:
         Failure mode: Raises RuntimeError if called before fit_conformal().
         """
         if self.mapie_ is None:
-            raise RuntimeError("MAPIEConformalWrapper.predict_with_interval() called before fit_conformal()")
+            raise RuntimeError(
+                "MAPIEConformalWrapper.predict_with_interval() called before fit_conformal()"
+            )
 
         proba = self.calibrated_model_.predict_proba(X)[:, 1]
         _, pred_sets = self.mapie_.predict_set(X)
@@ -147,7 +157,7 @@ class MAPIEConformalWrapper:
         sets = pred_sets[:, :, 0]
 
         intervals: list[tuple[float, float]] = []
-        for p, (in_class_0, in_class_1) in zip(proba, sets):
+        for p, (in_class_0, in_class_1) in zip(proba, sets, strict=True):
             if in_class_1 and not in_class_0:
                 low = max(0.0, float(p) - self.margin_)
                 high = min(1.0, float(p) + self.margin_)
@@ -163,7 +173,7 @@ class MAPIEConformalWrapper:
             intervals.append((low, high))
         return proba, intervals
 
-    def verify_coverage(self, X_test: pd.DataFrame, y_test) -> dict:
+    def verify_coverage(self, X_test: pd.DataFrame, y_test: ArrayLike) -> dict[str, Any]:
         """
         Purpose: Compute empirical coverage on the TEST split -- the
             fraction of rows whose true label is inside MAPIE's predicted
@@ -175,7 +185,9 @@ class MAPIEConformalWrapper:
         Failure mode: Raises RuntimeError if called before fit_conformal().
         """
         if self.mapie_ is None:
-            raise RuntimeError("MAPIEConformalWrapper.verify_coverage() called before fit_conformal()")
+            raise RuntimeError(
+                "MAPIEConformalWrapper.verify_coverage() called before fit_conformal()"
+            )
 
         y_test_arr = np.asarray(y_test).astype(int)
         _, pred_sets = self.mapie_.predict_set(X_test)

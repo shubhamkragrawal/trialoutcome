@@ -33,5 +33,43 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "mypy>=2.3.0",
+    "pandas-stubs>=3.0.5.260730",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.1",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["notebooks", "mlruns"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM"]
+# E501: line length handled by formatter.
+# N803/N806: this project's ML code follows scikit-learn's own naming
+# convention (`X`/`X_train`/`X_calib` for 2D feature matrices, matching
+# fit(X, y)) -- enforcing snake_case here would fight the one naming
+# convention every reader of this codebase already knows, not improve
+# clarity. See docs/decision-log/M9-review-fixes.md M9-12 for why this
+# deviates from the fix plan's literal `ignore = ["E501"]` only.
+ignore = ["E501", "N803", "N806"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["core"]
+# Don't type-check domains/ or tests/ initially -- expand later (P1-12 scope
+# was core/ only; the rest of the codebase hasn't been annotated with mypy
+# strictness in mind).
+
+# None of these ship inline types (py.typed) or a stub package for the
+# installed version -- mypy --strict has no way to check calls into them
+# regardless of how well-annotated this project's own code is. This is a
+# missing-stubs gap in the ML ecosystem, not a signal to fix; suppressing it
+# per-module (not globally) keeps strict mode meaningful for everything
+# actually checkable.
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "evidently.*", "shap.*", "mapie.*"]
+ignore_missing_imports = true

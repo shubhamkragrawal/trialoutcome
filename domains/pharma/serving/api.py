@@ -10,7 +10,6 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import mlflow
 import numpy as np
@@ -39,15 +38,15 @@ class TrialFeatures(BaseModel):
     """
     Input schema for POST /api/v1/predict.
 
-    DEVIATION FROM THE M5 PROMPT'S LITERAL SCHEMA (flagged, not silent --
+    DEVIATION FROM THE M5 SPEC'S LITERAL SCHEMA (flagged, not silent --
     see decisions.md M5 entry "TrialFeatures input schema corrected to match
-    the actually-trained feature set"): the prompt's `TrialFeatures` included
+    the actually-trained feature set"): the spec's `TrialFeatures` included
     `intervention_model`, which was never part of the trained feature set
     (train_pipeline.py's CATEGORICAL_FEATURES/NUMERIC_FEATURES do not include
     it -- the M1 spec-table note calling it a "bonus feature" turned out to
     be stale) and OMITTED `has_results`, which the model was actually trained
     on (rank-7 global SHAP importance -- see M4's error analysis). Serving
-    with the prompt's literal schema would either silently ignore a client-
+    with the spec's literal schema would either silently ignore a client-
     supplied field with no effect (intervention_model) or force a fabricated
     default for a real, importance-ranked feature (has_results) -- both worse
     than fixing the schema to match reality. `intervention_model` is dropped;
@@ -64,19 +63,19 @@ class TrialFeatures(BaseModel):
     """
 
     phase: str
-    log_enrollment_count: Optional[float] = None  # M9-1: accepted, ignored.
+    log_enrollment_count: float | None = None  # M9-1: accepted, ignored.
     num_primary_outcomes: int
     num_sites: int
-    has_dmc: Optional[bool] = None
-    masking: Optional[str] = None
-    allocation: Optional[str] = None
+    has_dmc: bool | None = None
+    masking: str | None = None
+    allocation: str | None = None
     has_results: bool
     eligibility_criteria_length: int
     exclusion_keyword_count: int
     sponsor_prior_trial_count: int
-    sponsor_prior_termination_rate: Optional[float] = None
-    sponsor_class: Optional[str] = None
-    condition_name: Optional[str] = None
+    sponsor_prior_termination_rate: float | None = None
+    sponsor_class: str | None = None
+    condition_name: str | None = None
     condition_rarity: int
     start_year: int
     start_quarter: int
@@ -109,7 +108,7 @@ class _PharmaModelBundle:
     extras: dict = field(default_factory=dict)
 
 
-bundle: Optional[_PharmaModelBundle] = None
+bundle: _PharmaModelBundle | None = None
 state = ServingState()
 
 
@@ -188,7 +187,7 @@ def _require_bundle() -> _PharmaModelBundle:
     return bundle
 
 
-def _condition_bucket(condition_name: Optional[str], top_conditions: list[str]) -> str:
+def _condition_bucket(condition_name: str | None, top_conditions: list[str]) -> str:
     value = condition_name if condition_name is not None else "unknown"
     if value in top_conditions:
         return value
@@ -206,7 +205,7 @@ def _row_from_trial_features(trial: TrialFeatures, b: _PharmaModelBundle) -> pd.
         defaults to 0.0 rather than the
         TRAIN-split median `config.yaml`'s missingness_policy specifies --
         replicating that exact median in live serving would require
-        persisting it as a training-time artifact, deferred past M5's DoD.
+        persisting it as a training-time artifact, deferred past M5's acceptance criteria.
     """
     has_dmc_str = "unknown" if trial.has_dmc is None else ("true" if trial.has_dmc else "false")
     bucket = _condition_bucket(trial.condition_name, b.top_conditions)
@@ -276,7 +275,9 @@ def _original_feature_of(expanded_name: str) -> str:
     return expanded_name
 
 
-def _top_shap_contributors(row_df: pd.DataFrame, b: _PharmaModelBundle, top_n: int = 5) -> list[dict]:
+def _top_shap_contributors(
+    row_df: pd.DataFrame, b: _PharmaModelBundle, top_n: int = 5
+) -> list[dict]:
     pre = b.xgb_pipeline.named_steps["pre"]
     expanded = pre.transform(row_df[b.feature_cols])
     expanded_names = list(pre.get_feature_names_out())
@@ -356,7 +357,7 @@ def predict_by_nct_id(nct_id: str) -> PredictionResponse:
     """
     NOTE: the M5 spec text lists this route as POST-only, but its own
     tests/test_api_contract.py calls it with `requests.get(...)` -- an
-    internal inconsistency in the milestone prompt. Since the route takes no
+    internal inconsistency in the milestone spec. Since the route takes no
     request body (only a path param), GET is arguably the more correct verb
     for a read-only fetch-by-ID anyway; both methods are registered so the
     literal test file passes and the documented contract (POST) still works.
@@ -368,7 +369,9 @@ def predict_by_nct_id(nct_id: str) -> PredictionResponse:
             {"nct_id": nct_id},
         ).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail=f"nct_id '{nct_id}' not found in ml.training_dataset")
+        raise HTTPException(
+            status_code=404, detail=f"nct_id '{nct_id}' not found in ml.training_dataset"
+        )
 
     row_df = _row_from_jsonb(row[0], b)
     return _predict_from_row(row_df, b)

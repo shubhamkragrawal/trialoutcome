@@ -3,7 +3,7 @@
 is currently there. Run as `python -m domains.pharma.monitoring.rollback
 --version N` (or `make rollback VERSION=N`).
 
-NOTE (spec deviation, see decisions.md's M7 entry): the M7 brief's literal
+NOTE (spec deviation, see decisions.md's M7 entry): the M7 requirements' literal
 `mlflow models transition-stage --name ... --version ... --stage Production`
 CLI snippet does not exist in the installed mlflow (2.22.5) -- `mlflow
 models --help` lists build-docker/generate-dockerfile/predict/prepare-env/
@@ -11,7 +11,7 @@ serve/update-pip-requirements only; there is no `transition-stage`
 subcommand anywhere in the mlflow CLI, because model-registry stage
 transitions are a Python-client/REST-API-only operation, not exposed via
 CLI. This module wraps `MlflowClient.transition_model_version_stage`
-directly (exactly the call the brief itself specifies inside this
+directly (exactly the call the requirements themselves specify inside this
 function's body) and exposes it as a one-command Makefile target instead,
 which is what actually satisfies "a one-command, tested rollback procedure."
 
@@ -24,7 +24,7 @@ domains/pharma/monitoring/retrain_trigger.py's "Staged for review" message,
 which prints this exact command). That keeps exactly one function in this
 entire codebase that ever transitions a version to stage "Production" via
 code -- everything else either registers to "Staging" or only reads stage
-state -- which is what M7's DoD grep check for auto-promotion is actually
+state -- which is what M7's acceptance criteria grep check for auto-promotion is actually
 protecting.
 """
 
@@ -80,6 +80,8 @@ def rollback_production(target_version: int) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="M7 rollback / manual promotion procedure")
-    parser.add_argument("--version", type=int, required=True, help="Model version to make Production")
+    parser.add_argument(
+        "--version", type=int, required=True, help="Model version to make Production"
+    )
     args = parser.parse_args()
     rollback_production(args.version)

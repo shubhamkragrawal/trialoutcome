@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import mlflow
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
@@ -101,7 +102,7 @@ class CalibratorWrapper:
         self.platt_: LogisticRegression | None = None
         self.result_: CalibrationResult | None = None
 
-    def fit(self, y_true, y_proba) -> CalibrationResult:
+    def fit(self, y_true: ArrayLike, y_proba: ArrayLike) -> CalibrationResult:
         """
         Purpose: Fit both calibrators on CALIB-split (y_true, y_proba),
             compute ECE before/after each, and pick the winner by lowest
@@ -151,7 +152,7 @@ class CalibratorWrapper:
         )
         return self.result_
 
-    def predict(self, y_proba, method: str | None = None) -> np.ndarray:
+    def predict(self, y_proba: ArrayLike, method: str | None = None) -> np.ndarray:
         """
         Purpose: Apply a fitted calibrator (default: the method chosen by
             fit()) to new raw probabilities -- e.g. the TEST split, for
@@ -162,11 +163,16 @@ class CalibratorWrapper:
         """
         if self.result_ is None:
             raise RuntimeError("CalibratorWrapper.predict() called before fit()")
+        # self.isotonic_/self.platt_ are always set together with
+        # self.result_ inside fit() -- the result_ is-None guard above is the
+        # real invariant; these asserts just let mypy see it too.
+        assert self.isotonic_ is not None
+        assert self.platt_ is not None
         method = method or self.result_.chosen_method
-        y_proba = np.asarray(y_proba, dtype=float)
+        y_proba_arr = np.asarray(y_proba, dtype=float)
         if method == "isotonic":
-            return self.isotonic_.predict(y_proba)
-        return self.platt_.predict_proba(y_proba.reshape(-1, 1))[:, 1]
+            return np.asarray(self.isotonic_.predict(y_proba_arr))
+        return np.asarray(self.platt_.predict_proba(y_proba_arr.reshape(-1, 1))[:, 1])
 
     def log_to_mlflow(
         self, tracking_uri: str, experiment_name: str, run_name: str = "xgboost_best_calibrated"
@@ -187,4 +193,4 @@ class CalibratorWrapper:
             mlflow.log_metric("ece_before", self.result_.ece_before)
             mlflow.log_metric("ece_after_isotonic", self.result_.ece_after_isotonic)
             mlflow.log_metric("ece_after_platt", self.result_.ece_after_platt)
-            return run.info.run_id
+            return str(run.info.run_id)

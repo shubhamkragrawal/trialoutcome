@@ -7,9 +7,10 @@ by the caller (see domains/pharma/train_pipeline.py).
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any
 
 import mlflow
 import numpy as np
@@ -74,7 +75,7 @@ class OptunaMLflowTrainer:
     def log_majority_baseline_run(self) -> None:
         """
         Purpose: Log a standalone MLflow run named 'majority_class_baseline'
-            so "beats baseline meaningfully" (M2 DoD) is a direct comparison
+            so "beats baseline meaningfully" (M2 acceptance criteria) is a direct comparison
             in the MLflow UI, not a number that only lives in a docstring.
         Leakage guard: N/A.
         Failure mode: If this run is never logged, every model run's
@@ -89,12 +90,14 @@ class OptunaMLflowTrainer:
             mlflow.log_metric("pr_auc_temporal", self.majority_baseline_pr_auc)
             mlflow.log_metric("pr_auc_random", self.majority_baseline_pr_auc_random)
             mlflow.log_metric("majority_baseline_pr_auc", self.majority_baseline_pr_auc)
-            mlflow.log_metric("majority_baseline_pr_auc_random", self.majority_baseline_pr_auc_random)
+            mlflow.log_metric(
+                "majority_baseline_pr_auc_random", self.majority_baseline_pr_auc_random
+            )
 
     def run_family(
         self,
         model_type: str,
-        build_pipeline: Callable[[optuna.Trial], tuple[Pipeline, dict]],
+        build_pipeline: Callable[[optuna.Trial], tuple[Pipeline, dict[str, Any]]],
         temporal: SplitData,
         random: SplitData,
         n_trials: int,
@@ -116,6 +119,10 @@ class OptunaMLflowTrainer:
             per fold) makes this exceedingly unlikely; a real occurrence
             should surface as a crash, not a silently-skipped fold.
         """
+        assert temporal.dates_train is not None, (
+            "run_family's `temporal` argument must carry dates_train -- it's None only "
+            "for the random regime, which has no CV ordering to sort by"
+        )
         order = np.argsort(temporal.dates_train.to_numpy())
         X_train_sorted = temporal.X_train.iloc[order].reset_index(drop=True)
         y_train_sorted = temporal.y_train.iloc[order].reset_index(drop=True)

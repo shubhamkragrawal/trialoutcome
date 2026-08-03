@@ -208,7 +208,11 @@ def generate_summary(
     )
 
     if is_high_risk:
-        supporting, opposing, opposing_label = increasing, decreasing, "One factor argues against the flag"
+        supporting, opposing, opposing_label = (
+            increasing,
+            decreasing,
+            "One factor argues against the flag",
+        )
     else:
         supporting, opposing, opposing_label = decreasing, increasing, "One factor to watch"
 
