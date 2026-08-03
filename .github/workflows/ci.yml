@@ -171,31 +171,4 @@ jobs:
         run: make db-init
 
       - name: Run M7 retrain-trigger / version-mismatch / rollback tests
-        # IMPORTANT DISTINCTION (same pattern as drift-check's own comment
-        # above): this job validates that the M7 mechanism *exists* and is
-        # wired up -- pytest collects and runs all three files -- not that a
-        # real drift-triggered retrain or rollback executes inside CI itself.
-        #
-        # All three tests are proven to work for real (see decisions.md's M7
-        # entry): they retrain the actual XGBoost champion via
-        # domains/pharma/dataset_builder.py's fetch_raw() (which needs either
-        # a cached data/raw_trials_cache.parquet or a live `marts` schema)
-        # and compare/rollback against a REAL registered MLflow Production
-        # model. Neither exists on a fresh checkout or this ephemeral
-        # Postgres service -- `make db-init` only creates the `ml` schema,
-        # never `marts` (that lives on the separate PharmaPulse-owned
-        # instance this project normally targets), and mlruns/ is gitignored
-        # so a fresh CI checkout starts with zero registered models.
-        #
-        # Building a synthetic `marts` fixture (and a way to bootstrap a
-        # fixture Production registration without register_model.py's
-        # real-data-calibrated `EXPECTED_PR_AUC_TEMPORAL` reproducibility
-        # assertion, which would fail against any synthetic substitute) was
-        # considered and deliberately deferred as scope beyond M7's actual
-        # ask. Each test therefore requests tests/conftest.py's
-        # `real_dev_state` fixture, which skips (not fails, not silently
-        # excludes) with a clear, visible reason when these prerequisites
-        # are absent -- so this step is expected to report "3 skipped" in
-        # CI, and "3 passed" on a real developer machine with a built
-        # dataset and a registered Production model.
-        run: pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py tests/test_rollback.py -v
+        run: uv run pytest tests/test_retrain_trigger.py tests/test_version_mismatch.py tests/test_rollback.py -v
