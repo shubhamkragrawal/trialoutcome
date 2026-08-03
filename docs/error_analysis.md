@@ -1,26 +1,28 @@
 # Error Analysis — TrialOutcome
 
-**Regenerated from scratch in M9.** Every number, every trial, and every theme on this page
-changed when `enrollment_count` was removed as target leakage — the previous version of this
-document analysed a model whose dominant feature encoded the label. See `decisions.md` M9-1.
+**Regenerated from scratch in M9, updated again for M9-11.** Every number, every trial, and every
+theme on this page changed twice: once when `enrollment_count` was removed as target leakage
+(M9-1), and again when `sponsor_prior_termination_rate`'s point-in-time bug was fixed (M9-11 — a
+historical trial was being counted as a termination based on its *current-day* status rather than
+its status as of the querying trial's own `start_date`). See `decisions.md` M9-1 and M9-11.
 
-Model: XGBoost champion (M2 hyperparameters, retrained in M9 on the no-enrollment feature set),
-isotonic-calibrated on CALIB, MLflow registry version **16** (`Production`).
-Cost-optimal threshold = **0.14**, selected on CALIB and reported on TEST
-(`domains/pharma/config.yaml` → `model.threshold_decision`; see `decisions.md` M9-4 for why the
-threshold moved from 0.22 and why it ships with a bootstrap interval).
-All numbers below are from the TEST split (`start_date >= 2022-01-01`, n=5,700, 31.7% positive).
+Model: XGBoost champion (M2 hyperparameters, retrained twice — M9-1 then M9-11 — on the
+no-enrollment, point-in-time-corrected feature set), isotonic-calibrated on CALIB, MLflow registry
+version **45** (`Production`). Cost-optimal threshold = **0.16**, selected on CALIB and reported on
+TEST (`domains/pharma/config.yaml` → `model.threshold_decision`; see `decisions.md` M9-4/M9-11 for
+why the threshold moved from 0.22 → 0.14 → 0.16 and why it ships with a bootstrap interval).
+All numbers below are from the TEST split (`start_date >= 2022-01-01`, n=5,789, 31.5% positive).
 
 ## Headline: what changed when the leak came out
 
-| | Pre-M9 (leaked) | M9 (honest) |
-|---|---|---|
-| TEST PR-AUC (uncalibrated) | 0.8878 | **0.6484** |
-| TEST ROC-AUC | 0.9178 | **0.7873** |
-| #1 feature by mean \|SHAP\| | `log_enrollment_count` (1.6443) | **`sponsor_prior_termination_rate` (0.5000)** |
-| False negatives at the operating threshold | — | 77 |
+| | Pre-M9 (leaked) | M9-1 (enrollment fixed) | M9-11 (sponsor-history also fixed) |
+|---|---|---|---|
+| TEST PR-AUC (uncalibrated) | 0.8878 | 0.6484 | **0.6193** |
+| TEST ROC-AUC | 0.9178 | 0.7873 | **0.7662** |
+| #1 feature by mean \|SHAP\| | `log_enrollment_count` (1.6443) | `sponsor_prior_termination_rate` (0.5000) | **`start_year` (0.3341)** |
+| False negatives at the operating threshold | — | 77 | **87** |
 
-Majority-class baseline PR-AUC on this split is 0.3167. The honest model earns 0.648 — squarely
+Majority-class baseline PR-AUC on this split is 0.3146. The honest model earns 0.619 — squarely
 inside the ~0.70–0.80 ROC-AUC band the published literature reports for registry-feature trial
 outcome prediction, which is where it should have been all along.
 
@@ -28,32 +30,36 @@ outcome prediction, which is where it should have been all along.
 
 | Rank | Feature | mean(\|SHAP\|) |
 |---|---|---|
-| 1 | `sponsor_prior_termination_rate` | 0.5000 |
-| 2 | `start_year` | 0.4124 |
-| 3 | `has_results` | 0.2528 |
-| 4 | `eligibility_criteria_length` | 0.1381 |
-| 5 | `num_sites` | 0.1246 |
-| 6 | `sponsor_prior_trial_count` | 0.1225 |
-| 7 | `has_dmc_str` | 0.1206 |
-| 8 | `masking` | 0.0925 |
-| 9 | `phase` | 0.0725 |
-| 10 | `num_primary_outcomes` | 0.0609 |
-| 11 | `condition_rarity` | 0.0326 |
-| 12 | `exclusion_keyword_count` | 0.0291 |
-| 13 | `sponsor_class` | 0.0241 |
-| 14 | `allocation` | 0.0206 |
-| 15 | `start_quarter` | 0.0131 |
+| 1 | `start_year` | 0.3341 |
+| 2 | `sponsor_prior_termination_rate` | 0.3276 |
+| 3 | `has_results` | 0.2422 |
+| 4 | `eligibility_criteria_length` | 0.1417 |
+| 5 | `has_dmc_str` | 0.1351 |
+| 6 | `num_sites` | 0.1313 |
+| 7 | `masking` | 0.1208 |
+| 8 | `phase` | 0.0902 |
+| 9 | `sponsor_prior_trial_count` | 0.0864 |
+| 10 | `num_primary_outcomes` | 0.0674 |
+| 11 | `sponsor_class` | 0.0318 |
+| 12 | `condition_rarity` | 0.0255 |
+| 13 | `exclusion_keyword_count` | 0.0197 |
+| 14 | `allocation` | 0.0160 |
+| 15 | `start_quarter` | 0.0116 |
 
-The ordering is far flatter than before. Pre-M9, the top feature was 4.4× the second; now it is
-1.2× the second. That flatness is itself the honest finding: **no single registry field predicts
-trial termination strongly**, and the previous model's apparent confidence came from reading the
-label off a column.
+**M9-11 changed the top-2 ordering, not just the values.** Under M9-1, `sponsor_prior_termination_rate`
+was the clear #1 (0.5000, 1.2× the #2 feature). After M9-11's point-in-time fix corrected its values
+(no longer using hindsight to count still-pending prior trials as resolved terminations),
+`start_year` edged narrowly into #1 — the two are now essentially tied (0.3341 vs 0.3276, a 1.02×
+gap). The ordering is still far flatter than pre-M9's 4.4× gap: **no single registry field
+predicts trial termination strongly**, and the previous model's apparent confidence came from
+reading the label off a column.
 
-`start_year` at rank 2 deserves a caveat — it is partly a data-recency artifact (trials that
-started recently are less likely to have reached a terminal status yet, and the label is only
-defined on terminal statuses), not purely a real trend. It is retained because the temporal split
-means the model never sees a future year at training time, but it should not be read as
-"trials are getting riskier."
+`start_year` deserves the same caveat it always has — it is partly a real secular trend
+(termination base rates rose from 17.8% pre-2020 to ~31.5% in the 2022+ test period, `decisions.md`
+M1) and partly a data-recency artifact (trials that started recently are less likely to have
+reached a terminal status yet, and the label is only defined on terminal statuses). It is retained
+because the temporal split means the model never sees a future year at training time, but it
+should not be read as "trials are getting riskier" in isolation from that artifact.
 
 ## 20 Worst False Negatives
 
@@ -65,99 +71,112 @@ partitioned by the sign of their contribution).
 
 | nct_id | proba | sponsor_prior_term_rate | sites | prior_trials | top_shap_feature |
 |---|---|---|---|---|---|
-| NCT05513391 | 0.036 | 3.9% | 31 | 335 | sponsor_prior_termination_rate |
-| NCT05967130 | 0.036 | 0.5% | 1 | 189 | sponsor_prior_termination_rate |
-| NCT06301308 | 0.036 | 0.0% | 1 | 51 | sponsor_prior_termination_rate |
-| NCT05398263 | 0.061 | 8.9% | 64 | 2,808 | has_results |
-| NCT06104683 | 0.061 | 0.0% | 4 | 14 | sponsor_prior_termination_rate |
-| NCT06736509 | 0.061 | 3.6% | 22 | 28 | sponsor_prior_termination_rate |
-| NCT06077773 | 0.067 | 0.0% | 48 | 3 | sponsor_prior_termination_rate |
-| NCT06400589 | 0.067 | 0.0% | 1 | 14 | sponsor_prior_termination_rate |
-| NCT02633514 | 0.082 | 2.7% | 1 | 812 | sponsor_prior_termination_rate |
-| NCT05124691 | 0.082 | 0.0% | 3 | 13 | sponsor_prior_termination_rate |
-| NCT05177770 | 0.082 | 0.0% | 9 | 10 | sponsor_prior_termination_rate |
-| NCT05194839 | 0.082 | 0.0% | 51 | 3 | sponsor_prior_termination_rate |
-| NCT05238025 | 0.082 | 2.1% | 120 | 48 | sponsor_prior_termination_rate |
-| NCT05254236 | 0.082 | 0.0% | 1 | 15 | sponsor_prior_termination_rate |
-| NCT05256134 | 0.082 | 11.8% | 63 | 1,848 | has_results |
-| NCT05262517 | 0.082 | 17.9% | 32 | 2,746 | has_results |
-| NCT05264506 | 0.082 | 5.8% | 103 | 499 | start_year |
-| NCT05368558 | 0.082 | 15.1% | 52 | 628 | has_results |
-| NCT05681481 | 0.082 | 8.3% | 40 | 36 | start_year |
-| NCT05694611 | 0.082 | 4.7% | 1 | 253 | sponsor_prior_termination_rate |
+| NCT05398263 | 0.022 | 5.6% | 64 | 2,808 | has_results |
+| NCT06128369 | 0.022 | 0.0% | 24 | 6 | start_year |
+| NCT05681481 | 0.058 | 0.0% | 40 | 36 | start_year |
+| NCT05694611 | 0.058 | 2.4% | 1 | 253 | eligibility_criteria_length |
+| NCT05513391 | 0.058 | 3.6% | 31 | 335 | start_year |
+| NCT05967130 | 0.058 | 0.5% | 1 | 189 | eligibility_criteria_length |
+| NCT06301308 | 0.058 | 0.0% | 1 | 51 | sponsor_prior_termination_rate |
+| NCT06077773 | 0.063 | 0.0% | 48 | 3 | start_year |
+| NCT06400589 | 0.063 | 0.0% | 1 | 14 | sponsor_prior_termination_rate |
+| NCT06104683 | 0.063 | 0.0% | 4 | 14 | start_year |
+| NCT05368558 | 0.063 | 9.9% | 52 | 628 | sponsor_prior_termination_rate |
+| NCT05194839 | 0.063 | 0.0% | 51 | 3 | start_year |
+| NCT06061081 | 0.063 | 7.6% | 18 | 236 | start_year |
+| NCT05288283 | 0.120 | 11.4% | 14 | 166 | start_year |
+| NCT07381530 | 0.120 | 0.0% | 3 | 5 | start_year |
+| NCT06011577 | 0.120 | 0.0% | 36 | 1 | start_year |
+| NCT05758415 | 0.120 | 11.9% | 24 | 2,332 | has_results |
+| NCT05753774 | 0.120 | 0.0% | 1 | 2 | eligibility_criteria_length |
+| NCT05722522 | 0.120 | 11.9% | 15 | 2,333 | has_results |
+| NCT05348681 | 0.120 | 0.0% | 12 | 4 | start_year |
 
-Representative summaries (full set in the M9 regeneration artifacts):
+Representative summaries (full set in the M9-11 regeneration artifacts):
 
-- **NCT06301308** — "This trial is flagged LOW RISK (missed) (4% estimated termination
+- **NCT06301308** — "This trial is flagged LOW RISK (missed) (6% estimated termination
   probability) primarily because: (1) the sponsor's prior termination rate is 0%, which is low
   relative to the training population, (2) eligibility criteria are typical in length at 64 words,
   (3) masking is SINGLE (below average). One factor to watch: start_year is 2023 (above average)."
-- **NCT05262517** — "This trial is flagged LOW RISK (missed) (8% estimated termination
-  probability) primarily because: (1) has_results is True (below average), (2) the trial runs at 32
-  sites -- a typical number of sites, (3) this is a Phase 3 trial. One factor to watch: the
-  sponsor's prior termination rate is 18%, which is roughly typical for the training population."
+- **NCT05398263** — "This trial is flagged LOW RISK (missed) (2% estimated termination
+  probability) primarily because: (1) has_results is True (below average), (2) the trial runs at
+  64 sites — a large, highly multi-site trial, (3) condition_Asthma is True (below average). One
+  factor to watch: start_year is 2022 (above average)."
 
-Note the second one: the model's own summary now surfaces that the sponsor's 18% termination rate
-argued *against* the low-risk call. Pre-M9 that factor would simply have been omitted, because the
-summary only ever listed factors supporting the stated direction by magnitude, without checking
-sign.
+Note both: the model's own summary now surfaces `start_year` as a "factor to watch" on nearly
+every worst miss — the direct consequence of `start_year` overtaking `sponsor_prior_termination_rate`
+as the #1 global driver under M9-11.
 
 ## Failure Themes
 
-Across **all 77** false negatives at the operating threshold, the top SHAP contributor is
-`sponsor_prior_termination_rate` for 55, `start_year` for 11, `has_results` for 10, and a condition
-one-hot for 1. The three themes below reflect that distribution.
+Across **all 87** false negatives at the operating threshold, the top SHAP contributor is
+`start_year` for 48, `eligibility_criteria_length` for 14, `sponsor_prior_termination_rate` for 12,
+`has_results` for 10, and a condition one-hot or `num_sites` for the remaining 3. **This is a
+different distribution than M9-1's** (`sponsor_prior_termination_rate` was top contributor for
+55/77 then) — M9-11's point-in-time fix didn't just change `sponsor_prior_termination_rate`'s
+values, it demoted the feature's role in the model's *worst* misses specifically, even though its
+overall global-SHAP rank barely moved (was #1, now a close #2). The four themes below reflect the
+new distribution.
 
-### Theme 1 — A clean sponsor record dominates everything else (14 / 20)
+### Theme 1 — Recency: the model reads "too soon to know" as "will complete" (48 / 87, 11/20 worst)
 
-- **Members:** NCT05513391, NCT05967130, NCT06301308, NCT06104683, NCT06736509, NCT06077773,
-  NCT06400589, NCT02633514, NCT05124691, NCT05177770, NCT05194839, NCT05238025, NCT05254236,
-  NCT05694611.
-- **Shared signature:** every one has `sponsor_prior_termination_rate <= 5%`, and for all 14 that
-  feature is the single largest SHAP contributor, pushing hard toward "will complete."
-- **Why the model struggles:** this is the direct, predictable consequence of removing the leaked
-  feature. The model is now substantially a *sponsor-reputation* model, and sponsor reputation is
-  an aggregate that says nothing about the specific trial's drug, protocol, or funding decision. A
-  sponsor with a 0% historical termination rate will eventually terminate a trial, and when they
-  do, this model has no mechanism to anticipate it. **This theme is not a bug to fix; it is the
-  ceiling of the current feature set**, and it is the honest version of what pre-M9 Theme 3 was
-  gesturing at.
-- **Second-order concern:** `sponsor_prior_termination_rate` being rank 1 makes its known
-  point-in-time weakness materially more important than it was pre-M9, when it ranked 2 behind a
-  feature doing all the work. See Known Limitations below — the prior trials' *final* labels are
-  used, not their status as of this trial's start date.
+- **Members (worst-20):** NCT06128369, NCT05681481, NCT05513391, NCT06077773, NCT06104683,
+  NCT05194839, NCT06061081, NCT05288283, NCT07381530, NCT06011577, NCT05348681.
+- **Shared signature:** `start_year` is the largest SHAP contributor, consistently pushing toward
+  "will complete" for later-starting trials.
+- **Why the model struggles:** `start_year` conflates two effects it cannot separate — a genuine
+  secular rise in termination rates (17.8% pre-2020 → 31.5% in 2022+) and a data-recency artifact
+  (a trial's label is only defined once it reaches a terminal status, so recently-started trials
+  are systematically under-represented among *known* terminations at prediction time even though
+  their true future termination risk may be just as high). The model correctly learns "recent →
+  less often labeled terminated in TRAIN," but that's partly a labeling-maturity fact about the
+  data, not a property of the trial itself. **This is now the largest theme, and the most
+  structurally hard one to fix** — it is a property of how the label matures over time, not a
+  missing feature.
 
-### Theme 2 — `has_results = True` at mega-sponsors overrides a mediocre sponsor record (4 / 20)
+### Theme 2 — Long, detailed eligibility criteria read as design rigor, sometimes wrongly (14 / 87, 3/20 worst)
 
-- **Members:** NCT05398263 (2,808 prior trials, 64 sites), NCT05256134 (1,848 / 63),
-  NCT05262517 (2,746 / 32), NCT05368558 (628 / 52).
-- **Shared signature:** these are the *only* rows in the worst-20 whose sponsor termination rate is
-  **not** low (8.9%, 11.8%, 17.9%, 15.1% — the four highest in the table). For all four,
-  `has_results = True` is the top contributor and pushes toward completion strongly enough to
-  overwhelm the sponsor signal.
-- **Why the model struggles:** `has_results` was verified non-leaky in M1 (1,228 actively-recruiting
-  trials already carry `has_results = true`, so it is populated before completion for a meaningful
-  share of trials). It is still a *reporting-behavior* signal, not a design signal: large,
-  well-resourced sponsors post results consistently, so the feature substantially proxies "big
-  organized sponsor." When such a sponsor terminates a trial anyway, the feature points confidently
-  the wrong way. Worth re-verifying if it ever climbs above rank 3.
+- **Members (worst-20):** NCT05694611, NCT05967130, NCT05753774.
+- **Shared signature:** `eligibility_criteria_length` is the top contributor — longer, more
+  detailed eligibility sections are associated with predicted completion (a "design rigor"
+  signal), but two of these three specific misses actually have *short* (59, "typical") criteria
+  lengths, meaning the model is reading a near-average value as reassuring rather than neutral.
+- **Why the model struggles:** the feature genuinely correlates with completion on average, but a
+  near-median value carries a SHAP push in only one direction (toward completion) with nothing to
+  counterbalance it when other signals are also weak/absent — a limitation of a monotonic
+  tree-based push rather than a true design-quality assessment.
 
-### Theme 3 — Recency (2 / 20)
+### Theme 3 — A clean sponsor record still dominates a meaningful minority (12 / 87, 3/20 worst)
 
-- **Members:** NCT05264506 (2022), NCT05681481 (2023).
-- **Shared signature:** `start_year` is the top contributor; both are large multi-site trials
-  (103 and 40 sites) at established sponsors.
-- **Why the model struggles:** `start_year` carries the recency artifact described above. For
-  trials near the start of the TEST window it contributes a mild "recent trials complete" push that
-  reflects label-availability mechanics as much as any real trend. This is the smallest theme and
-  the one most likely to be an artifact rather than a finding.
+- **Members (worst-20):** NCT06301308, NCT06400589, NCT05368558.
+- **Shared signature:** every one has `sponsor_prior_termination_rate <= 10%`, and for these three
+  it remains the single largest SHAP contributor.
+- **Why the model struggles:** this is the residual version of M9-1's Theme 1 — the model is
+  still, for a meaningful subset of misses, substantially a sponsor-reputation model, and a low
+  historical termination rate says nothing about *this* trial's drug, protocol, or funding
+  decision. M9-11's fix corrected the feature's *values* (removing the hindsight leak) but not
+  this structural ceiling — a sponsor with a genuinely clean point-in-time record will still
+  eventually have a trial terminate, and the model has no mechanism to anticipate which one.
+
+### Theme 4 — `has_results = True` at mega-sponsors overrides a mediocre sponsor record (10 / 87, 3/20 worst)
+
+- **Members (worst-20):** NCT05398263 (2,808 prior trials, 64 sites), NCT05758415 (2,332 / 24),
+  NCT05722522 (2,333 / 15).
+- **Shared signature:** these three all have `sponsor_prior_termination_rate` in the 5.6–11.9%
+  range — not the lowest in the table — but `has_results = True` is the top contributor and pushes
+  toward completion strongly enough to override the (already middling) sponsor signal.
+- **Why the model struggles:** `has_results` was verified non-leaky in M1 (populated pre-completion
+  for a meaningful share of trials). It is still a *reporting-behavior* signal, not a design
+  signal: large, well-resourced sponsors post results consistently, so the feature substantially
+  proxies "big organized sponsor." When such a sponsor terminates a trial anyway, the feature
+  points confidently the wrong way.
 
 ## Multicollinearity Findings
 
 Pearson correlation across the 9 engineered numeric/ordinal features (`num_primary_outcomes`,
 `num_sites`, `eligibility_criteria_length`, `exclusion_keyword_count`, `sponsor_prior_trial_count`,
 `sponsor_prior_termination_rate`, `condition_rarity`, `start_year`, `start_quarter`), computed on
-TRAIN (n=66,105). `log_enrollment_count` is absent from this list — it was dropped in M9.
+TRAIN (n=66,129). `log_enrollment_count` is absent from this list — it was dropped in M9-1.
 
 **Pairs with |r| > 0.6:**
 
@@ -165,38 +184,43 @@ TRAIN (n=66,105). `log_enrollment_count` is absent from this list — it was dro
 |---|---|---|---|
 | `eligibility_criteria_length` | `exclusion_keyword_count` | 0.70 | No |
 
-`eligibility_criteria_length` now ranks **4th** in aggregated global SHAP importance (it ranked
-10th pre-M9 — everything moved up when enrollment left); `exclusion_keyword_count` ranks 12th,
-still below the top-10 cutoff. **Because only one member of the pair is in the top-10, no
-attribution-splitting caveat is required for this build.**
+`eligibility_criteria_length` ranks **4th** in aggregated global SHAP importance (it ranked 10th
+pre-M9 — everything moved up when enrollment left, and M9-11 didn't change this rank);
+`exclusion_keyword_count` ranks 13th, still well below the top-10 cutoff. **Because only one
+member of the pair is in the top-10, no attribution-splitting caveat is required for this build.**
 
-That said, the margin is thinner than it was. The trigger condition to add the caveat is unchanged
-and now closer to firing: if `exclusion_keyword_count` rises into the top-10 on a future retrain,
-the two features' SHAP values must be read together rather than attributed independently, since a
-bullet-heavy eligibility section mechanically produces both a longer `eligibility_criteria_length`
-and a higher `exclusion_keyword_count`.
+That said, the margin is thinner than it was pre-M9. The trigger condition to add the caveat is
+unchanged and still worth watching: if `exclusion_keyword_count` rises into the top-10 on a future
+retrain, the two features' SHAP values must be read together rather than attributed independently,
+since a bullet-heavy eligibility section mechanically produces both a longer
+`eligibility_criteria_length` and a higher `exclusion_keyword_count`.
 
 No other feature pair exceeds |r| > 0.6.
 
 ## Known Limitations
 
-- **`enrollment_count` was target leakage and is gone (M9).** `WITHDRAWN` is definitionally a
+- **`enrollment_count` was target leakage and is gone (M9-1).** `WITHDRAWN` is definitionally a
   zero-enrollment status, so `P(label=1 | enrollment == 0) = 1.000` on TEST. It contributed ~40%
-  of the model's entire lift over baseline. Removing it cut TEST PR-AUC from 0.888 to 0.648. The
-  fix that looked obvious — keeping only `ESTIMATED`-typed enrollment — was also rejected, on
-  measurement: its missingness indicator becomes a proxy for post-hoc record state and supplies 85%
-  of that variant's apparent gain. Full analysis in `decisions.md` M9-1.
-- **Sponsor history uses each prior trial's final label, not its status as of this trial's
-  `start_date`.** A prior trial that started in 2015 and terminated in 2019 counts as "terminated"
-  in the history of a trial starting in 2018, when nobody knew that yet. Inherited from the spec's
-  example SQL and flagged since M1 — but now materially more important, since
-  `sponsor_prior_termination_rate` is the model's **#1** feature rather than its #2 behind a leaked
-  column. Scheduled for a real fix in M9 P1-11.
-- **The operating threshold is unstable.** CALIB selects 0.14, TEST would have selected 0.22, and a
-  1,000-resample bootstrap puts the 95% CI at [0.10, 0.20]. The cost surface is flat across that
-  range (3.7% regret), so the choice is defensible, but the point estimate should not be quoted
-  without its interval. At 0.14 the model flags 70.5% of trials that actually complete — a triage
-  filter, not an automated decision gate.
+  of the model's entire lift over baseline (measured at the time of that investigation). Removing
+  it cut TEST PR-AUC from 0.888 to 0.648. The fix that looked obvious — keeping only
+  `ESTIMATED`-typed enrollment — was also rejected, on measurement: its missingness indicator
+  becomes a proxy for post-hoc record state and supplies 85% of that variant's apparent gain. Full
+  analysis in `decisions.md` M9-1.
+- **Sponsor-history hindsight leak fixed (M9-11); one residual gap remains.** Prior trials were
+  being counted as terminations based on their *current-day* status rather than their status as of
+  this trial's own `start_date` — fixed by requiring an ACTUAL (not ESTIMATED) resolution date
+  strictly before `start_date`. Measured effect on the 2023+ subset: average rate dropped
+  0.108 → 0.067 (−38% relative), 58% of rows changed. The residual gap: a prior trial genuinely
+  still running as of `start_date` is treated identically to one that will later complete
+  successfully — its true future outcome is unknowable at that point by construction (correct
+  point-in-time behavior), but it means the feature still can't distinguish "clean track record"
+  from "track record mostly still pending." Full analysis in `decisions.md` M9-11.
+- **The operating threshold moved twice, and is now more stable.** M9-4 refit CALIB to 0.14 against
+  TEST's 0.22 (gap 0.08, "unstable," 95% CI [0.10, 0.20]). M9-11's sponsor-history fix moved CALIB
+  to 0.16, narrowing the gap to TEST's 0.21 to exactly 0.05 ("stable" by the same rule), 95% CI
+  [0.13, 0.21], with TEST's value now falling inside the CI. Regret vs. the unattainable
+  TEST-optimal choice improved from 3.7% to 2.8%. At 0.16 the model flags 72.9% of trials that
+  actually complete — a triage filter, not an automated decision gate.
 - **Isotonic calibration saturates.** Some served probabilities pin at exactly 0.000 / 1.000, which
   produces summaries claiming "100% estimated termination probability." Clipping to [0.01, 0.99] is
   queued as M9 P2-18; replacing isotonic with beta calibration or a monotone spline is the real fix
@@ -206,8 +230,11 @@ No other feature pair exceeds |r| > 0.6.
 - **`therapeutic_area` is NULL for all rows in `dim_condition`** — `condition_name` is used as a
   proxy throughout (condition one-hot + condition rarity), coarser than a true therapeutic-area
   grouping.
+- **`start_year` conflates a real secular trend with a label-maturity artifact**, and after M9-11
+  it is the single largest driver of both global SHAP importance and the worst false negatives
+  (Theme 1, 48/87). This is the least tractable of the known limitations — it isn't a data-quality
+  bug to fix, but a structural property of predicting a label that can only be observed once a
+  trial reaches a terminal status.
 - **The 5:1 FN:FP cost ratio is a domain assumption**, not empirically derived from clinical-
   operations cost data. A real deployment needs that ratio validated (or replaced) by clinical
-  operations / portfolio-management stakeholders before the threshold is trusted operationally —
-  and the M9 instability finding means the ratio and the threshold have to be revisited together,
-  since a flat cost surface is a property of *this* ratio at *this* base rate.
+  operations / portfolio-management stakeholders before the threshold is trusted operationally.
