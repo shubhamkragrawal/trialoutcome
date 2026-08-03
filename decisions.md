@@ -1799,3 +1799,332 @@
 - [x] `decisions.md` updated with M8 entries (this section).
 - [x] TrialOutcome project marked complete in README -- "Status: all 8 milestones
       complete (M1–M8)" added directly under the intro paragraph.
+
+---
+
+# M9 — Review-driven fixes
+
+Source: `final_review.md` (senior DS/AI engineer + hiring-manager review of commit
+`6d93c28`, 2026-08-02). Plan: `ai_portfolio/M9_REVIEW_FIXES_PLAN.md`. Spec addendum:
+`02_TRIALOUTCOME_SPEC.md` Section 10.
+
+## Decision (review-driven, P0): `enrollment_count` dropped as target leakage; fix path A rejected on evidence after being shown to be available
+
+- **What:** Investigated `enrollment_count` after `final_review.md` §1.1 flagged it as
+  target-leaking. Confirmed the review's evidence against the repo's own cached data
+  (n=78,115) and feature pipeline: `P(label=1 | enrollment_count == 0) = 0.981` overall
+  and `1.000` on TEST. The mechanism is definitional, not statistical — `WITHDRAWN`
+  means "stopped before enrolling the first participant," so actual enrollment is 0 by
+  definition of the label class. Ablation with the champion hyperparameters on the
+  locked temporal split reproduced the review's numbers exactly: full pipeline
+  **0.8878** PR-AUC → without enrollment **0.6484**, a delta of **0.2394**, i.e. ~40% of
+  the total lift over the 0.3167 majority baseline came from a column encoding the
+  label. Dropped `enrollment_count`, `log_enrollment_count`, and `enrollment_missing`;
+  retrained the champion on the reduced feature set (37 features, down from 39);
+  re-registered as Production.
+
+- **Fix path taken: B (drop), after A was investigated, found *available*, and rejected
+  on measured evidence.** This is the part worth reading. The plan's decision tree said
+  to prefer path A (keep planned-only enrollment via `enrollment_type`) and to fall back
+  to B only if `enrollment_type` was unavailable upstream. The diagnosis found:
+    - `enrollment_type` is **not** in `marts.fct_trials` and **not** in `staging.stg_trials`
+      — so by the plan's own literal trigger, path A was already blocked.
+    - But it **is** recoverable from `raw.ct_studies`, whose JSONB payload carries
+      `protocolSection.designModule.enrollmentInfo.type` (`ACTUAL`/`ESTIMATED`) for all
+      596,690 staged studies. Path A was therefore genuinely buildable with a
+      raw→staging→mart passthrough in PharmaPulse. I built it as an experiment before
+      committing to it.
+    - Measured on the modeling set, `enrollment_type` splits **ACTUAL 70,439 /
+      ESTIMATED 3,101 / missing 4,575**. It cleanly isolates the definitional leak:
+      **3,994 of 3,994** `WITHDRAWN` trials with `type='ACTUAL'` have
+      `enrollment_count = 0`, while `WITHDRAWN`+`ESTIMATED` rows (n=57) have none.
+    - So path A "works" — but it nulls **96%** of the column, and the resulting model
+      scores 0.6821 vs path B's 0.6484. That +0.0337 looked like free signal.
+    - **Decomposing where that +0.0337 comes from is what killed path A.** Under path A
+      the surviving `enrollment_missing` indicator no longer means "enrollment unknown";
+      it means `enrollment_type != 'ESTIMATED'`. And *that* is post-hoc: every trial's
+      enrollment record reads `ESTIMATED` at registration and only flips to `ACTUAL`
+      once the trial reports actual enrollment. Measured contributions over path B:
+
+      | Path A variant | TEST PR-AUC | lift over B |
+      |---|---|---|
+      | value + missingness indicator | 0.6821 | +0.0337 |
+      | **indicator only (no enrollment magnitude at all)** | **0.6772** | **+0.0288** |
+      | value only (no indicator) | 0.6656 | +0.0172 |
+      | path B (dropped entirely) | 0.6484 | — |
+
+      A bare bit carrying zero enrollment magnitude supplies **85% of path A's entire
+      advantage**. Path A does not remove the leak; it swaps an obvious definitional
+      leak for a subtler record-maintenance one. Even the "value only" variant leaks,
+      because 96% of rows share one imputed median and are trivially separable.
+    - Rejected path A and took B. Also confirmed the raw payload is a current snapshot
+      with no version history (`protocolSection` has no revision module), so genuine
+      registration-time planned enrollment is **not** recoverable from this warehouse at
+      all — the trigger-to-reconsider below is corrected accordingly.
+
+- **Numbers republished:** `domains/pharma/config.yaml` (feature list, `dropped_features`,
+  missingness policy, threshold block), `register_model.py` baseline constant,
+  `train_pipeline.py` `NUMERIC_FEATURES`, `serving/api.py` request schema + row builder.
+  README, `docs/error_analysis.md`, SHAP plots, and the M6 drift baseline follow in the
+  same M9 sweep.
+
+- **Why (vs. alternatives):**
+    - *Keep and disclose as a known limitation:* rejected — a known limitation is where
+      you put things you can't fix, not the thing producing your headline number.
+    - *Regularize / re-weight the feature:* rejected — leakage is a semantics problem,
+      not an over-fitting problem you tune away.
+    - *Zero → missing patch:* rejected explicitly by the review (§1.1) — leaves graded
+      post-hoc signal in the nonzero values.
+    - *Path A (planned-enrollment only):* rejected **on measurement, not on
+      availability** — see the decomposition above. This is the non-obvious call in M9,
+      and the ablation that produced it is the reason it's defensible rather than a
+      preference.
+
+- **Failure mode:** the leakage-detection framework built in M1/M2 (temporal-vs-random
+  split, controlled fixed-window ablation, honest-vs-leaky sponsor history) produced a
+  genuine **true negative** — there is no temporal row-placement leakage in this dataset.
+  But it structurally *could not* detect this leak, because every test in it asks "which
+  rows went where," and this leak lives in "is this value knowable at `start_date`?"
+  `core/dataset_builder_base.py`'s docstring already drew that distinction; nothing
+  pointed it at `enrollment_count` until the review did. The second-order failure mode is
+  the one path A demonstrates: once you know to look for semantic leakage, the *fix* can
+  reintroduce it in a less visible form, and only an ablation tells you.
+
+- **Scaling story (10x / 100x):** unchanged — a semantics problem, not a scale one. At
+  100x the same leak produces a more confidently wrong model faster. What *does* scale is
+  the check: a feature-semantics review ("what populates this column, and when?") is
+  O(number of features), runs once per feature at design time, and is the only thing that
+  would have caught this before training.
+
+- **Trigger to reconsider (CORRECTED vs. the plan's template):** the plan proposed
+  "if PharmaPulse ever exposes `enrollment_type`." That trigger is now known to be
+  insufficient — `enrollment_type` **is** exposed in `raw`, and using it does not fix the
+  problem. The correct trigger is: **if a registration-time snapshot becomes available**
+  — ClinicalTrials.gov's versioned-record/history API, which returns each field as of the
+  original registration date. That, and only that, makes planned enrollment a legitimate
+  feature. Absent it, enrollment stays out.
+
+- **Interview question this maps to:** *"Your leakage tests found nothing but there was
+  leakage anyway. Walk me through how."* — the framework was correctly designed for the
+  leakage class it tested (temporal row placement) and returned a true negative; it
+  missed a different class (feature semantics); a review-driven ablation caught it. The
+  follow-up worth volunteering: *"and then the obvious fix turned out to leak too, which
+  I only found because I ablated the fix instead of trusting it."*
+
+## Decision (review-driven, P0): threshold selected on CALIB and reported on TEST; instability contingency fired, bootstrap CI reported
+
+- **What:** `ThresholdSelector.find_cost_optimal_threshold()` was being swept against
+  TEST-split probabilities, with precision/recall/expected-cost then reported at the
+  winning threshold on that same split. Moved selection to CALIB (n=6,310), froze the
+  threshold, and report the decision table on TEST (n=5,700). Corrected the class
+  docstring, which had argued in writing that "threshold selection is a downstream
+  reporting step, not a fitting step" — that argument is wrong, and the docstring
+  committing to it was the more damaging half of the bug.
+- **Result:** CALIB selects **0.14**; TEST would have selected **0.22**. The plan set
+  ~0.05 as the divergence that means "unstable, needs a bootstrap CI rather than a point
+  estimate." The gap is 0.08, so that contingency fired and the bootstrap was run rather
+  than noted:
+    - 1,000-resample bootstrap of the CALIB selection: **95% CI [0.10, 0.20]**, median
+      0.14 — an interval 0.10 wide.
+    - The TEST-optimal 0.22 falls **outside** that CI.
+    - The cost surface is nearly flat across the region: on TEST, cost is 3,130 at 0.14
+      vs 3,019 at 0.22 — **3.7% regret** for selecting honestly. That 3.7% is precisely
+      the optimism the old TEST-selected number was hiding, which is a satisfyingly small
+      and concrete answer to "how much did this actually matter."
+- **Operational consequence, stated plainly:** at 0.14 the model flags **70.5%** of
+  trials that actually complete (recall 0.957, precision 0.386). A 5:1 FN:FP matrix
+  applied to a genuinely weaker post-M9 model asks for a very aggressive operating point.
+  This is a triage filter, not an automated decision gate, and the README/config say so
+  rather than quoting recall alone.
+- **Why (vs. alternatives):**
+    - *Nested CV on the threshold:* better statistics, more machinery than a
+      one-parameter fit warrants; CALIB-fit/TEST-report captures most of the
+      credibility for a fraction of the work.
+    - *Keep 0.22 because it's the better operating point:* rejected — it is only better
+      *as measured on the split that chose it*. Choosing it knowingly is worse than
+      having chosen it accidentally.
+    - *Report the point estimate alone:* rejected once the CI came back 0.10 wide;
+      a point estimate implies a precision this operating point does not have.
+- **Failure mode:** if the cost surface had been sharply peaked instead of flat, an
+  0.08 selection error would translate into a large real cost gap rather than 3.7%, and
+  a point estimate would be actively dangerous. The flatness is what makes this
+  recoverable — and flatness is a property of *this* cost matrix and base rate, so it
+  must be re-checked whenever either changes, not assumed.
+- **Scaling story (10x / 100x):** with 10x the CALIB rows the bootstrap CI narrows
+  roughly as 1/√n and the point estimate becomes meaningful on its own. At 100x, the
+  binding constraint stops being statistical and becomes operational — the threshold
+  would be set by review capacity (how many trials a team can actually triage per week),
+  with the cost sweep used to price that capacity rather than to pick the number.
+- **Interview question this maps to:** *"Walk me through your threshold selection and the
+  split it ran on."* — CALIB fit, TEST report, and the honest extra: the two splits
+  disagreed by more than my own stability criterion allowed, so the deliverable is an
+  interval and a 3.7% regret figure, not a number.
+
+## Decision (review-driven, P0): plain-English summaries partition SHAP factors by sign; `high_risk` → `HIGH RISK` in prose only
+
+- **What:** `generate_summary()` cited the top-3 SHAP contributors by absolute magnitude
+  as "reasons for the flag" without consulting the sign of their contribution. Factors
+  are now partitioned into risk-increasing and risk-decreasing, ordered by magnitude
+  within each; a HIGH RISK flag cites only risk-increasing factors, a LOW RISK flag only
+  risk-decreasing ones, and the strongest opposing factor is surfaced separately as
+  "One factor argues against the flag" / "One factor to watch" rather than dropped.
+  Separately, the human-readable string now renders `HIGH RISK`/`LOW RISK`; the
+  machine-readable `threshold_decision` field is untouched (`high_risk`/`low_risk`) since
+  it is part of the locked contract RegIntel builds against.
+- **Scope of the bug, measured:** on the TEST split at the M9 threshold, **2,943 of 4,473
+  HIGH RISK predictions (65.8%)** cited at least one risk-decreasing factor among their
+  three stated reasons. This was not a rare edge case; it was the majority of served
+  high-risk explanations.
+- **Before / after (NCT01451853, proba 0.213, real TEST row):**
+    - *Before:* "This trial is flagged high_risk (21% estimated termination probability)
+      primarily because: (1) **the sponsor's prior termination rate is 0%, which is low
+      relative to the training population**, (2) start_year is 2026 (above average),
+      (3) has_results is False (above average)."
+    - *After:* "This trial is flagged HIGH RISK (21% estimated termination probability)
+      primarily because: (1) start_year is 2026 (above average), (2) has_results is False
+      (above average), (3) a Data Monitoring Committee is registered. One factor argues
+      against the flag: the sponsor's prior termination rate is 0%, which is low relative
+      to the training population."
+    - The before-text is the failure in one line: a spotless sponsor record offered as a
+      reason the trial is high-risk. Its SHAP contribution was −0.682 — the single
+      largest-magnitude factor, and pointing the opposite way.
+- **Why (vs. alternatives):**
+    - *Drop opposing factors silently:* rejected — that would overstate confidence.
+      A model whose top driver argues against its own flag is telling the reader
+      something real, and a borderline call should look borderline.
+    - *Sort by signed contribution instead of partitioning:* rejected — it produces the
+      right top-of-list most of the time but still lets a wrong-signed factor into
+      position 3 whenever few factors point the flagged way, which is exactly the
+      borderline case where the summary is read most carefully.
+    - *Change `threshold_decision` to `HIGH RISK` too:* rejected — that is the locked
+      cross-project contract; a display concern must not reach into the machine-readable
+      field. The split (enum stays, prose humanizes) is the whole point.
+- **Failure mode:** if a flag has NO supporting factors at all, the summary now says so
+  explicitly ("none of its top factors point that way -- the flag rests on the threshold,
+  not on any single driver") instead of manufacturing a justification. That string
+  appearing in production is a genuine signal that the threshold and the explanation have
+  come apart, and it should be alarming rather than invisible. Unit-tested.
+- **Scaling story (10x / 100x):** the partition is O(k) over an already-computed top-k
+  and costs nothing. At scale the real risk is template coverage, not sorting: every
+  feature without an entry in `_TEMPLATES` falls back to "`feature` is `value`
+  (above/below average)", which is not a real population comparison. The fallback is
+  already documented as such; at 100x features it would need frozen training-population
+  quantiles to stay honest.
+- **Interview question this maps to:** *"Show me a plain-English summary you'd be
+  comfortable putting in front of a Clinical Operations VP."* — with the before/after
+  above, and the 65.8% figure, because "I found it, measured how often it fired, and
+  fixed it" is a better answer than a clean example.
+
+## Addendum to M9-1: `notebooks/02_leakage_demo.ipynb` was not, in fact, unaffected
+
+The M9 plan and the first pass of this fix assumed `notebooks/02_leakage_demo.ipynb` (the
+temporal-vs-random row-placement leakage experiment, M1) was independent of the enrollment
+fix, since it predates M9 and tests a different leakage class. That assumption was wrong in
+one respect: the notebook hardcodes its own `NUMERIC` feature list (separate from
+`train_pipeline.py`'s), and that list included `log_enrollment_count`/`enrollment_missing`.
+Once `PharmaDatasetBuilder.build_features()` stopped producing those columns (M9-1), the
+notebook would `KeyError` on re-execution.
+
+- **Fixed:** notebook 02's `NUMERIC` list, re-executed end to end. Numbers moved
+  substantially (temporal PR-AUC 0.8657→0.5676, random 0.6823→0.3687) — mechanically
+  expected, since enrollment was a dominant feature here too, just less overwhelmingly so
+  for a linear model than for XGBoost. The **qualitative finding is unchanged**: temporal
+  still scores higher than random, ROC-AUC still rules out a pure base-rate artifact, and
+  the sponsor-history coefficient still points the "wrong" way for a leakage story.
+- **Controlled ablation re-run** (XGBoost + LightGBM, same previously-logged best
+  hyperparameters, no fresh Optuna sweep — logged as new MLflow runs under
+  `controlled_ablation_{model}_best`):
+
+  | Model | Honest PR-AUC | Leaky PR-AUC | Delta |
+  |---|---|---|---|
+  | LogReg | 0.4568 | 0.4558 | −0.0009 |
+  | XGBoost | 0.5338 | 0.5472 | +0.0134 |
+  | LightGBM | 0.5583 | 0.5672 | +0.0089 |
+
+  Pre-M9 the tree-model deltas were ≤0.002 (noise-level on a ~0.80 PR-AUC base); post-M9
+  they're 0.009–0.013, a larger share of a smaller base (~1.6–2.5% relative vs ~0.15%
+  before). Recorded honestly rather than kept at the old figure — not strong evidence a
+  temporal leak reappeared (LogReg's delta is still negative), but a weaker model has a
+  wider noise band around a small effect, and this is close enough to the boundary that
+  it's worth tracking on future retrains rather than assuming ≤0.002 is a permanent property
+  of this feature set.
+- **Why this matters beyond the specific fix:** it's a second, smaller instance of the same
+  lesson M9-1 is about — a change made for one reason (dropping a leaked feature) had a
+  side effect (breaking a notebook, and moving a second experiment's numbers) that only
+  surfaced by actually trying to re-run everything downstream, not by reasoning about scope
+  from the plan document alone.
+
+## Possible future revisit (flagged, not changed): `WITHDRAWN`/`SUSPENDED` in the positive class
+
+The review (§1.1) and the M9 fix plan both raise this without asking for it to be changed:
+"never started" (`WITHDRAWN`) and "started then stopped" (`TERMINATED`) are different
+business events with different interventions, and the interaction with `enrollment_count`
+was specifically bad — `WITHDRAWN` is definitionally zero-enrollment, which is exactly the
+leak M9-1 removed. A `COMPLETED` vs `TERMINATED`-only label (dropping `WITHDRAWN`/
+`SUSPENDED` from the positive class entirely) is a defensible alternative framing, immune to
+this specific leak by construction, and was not implemented here per the plan's explicit
+instruction: **label definition is a spec-level decision requiring approval, not an
+implementation-forced change.** The current label (`TERMINATED`/`WITHDRAWN`/`SUSPENDED` all
+positive) stays as-is. If revisited: re-derive the base rate (currently 19.9% derived vs
+14.3% if `WITHDRAWN`/`SUSPENDED` were excluded), re-run the full M1–M9 pipeline, and treat it
+as a new milestone, not a patch — the split dates, cost matrix, and every downstream number
+in this repo are keyed to the current definition.
+
+## Decision (review-driven, P0): `tests/conftest.py` scoping bug fixed; CI guard added, shaped as soft-fail after a real spec/reality conflict surfaced
+
+- **What:** `_has_real_dev_state()` had two bugs stacked on each other, described in the
+  updated docstring in full. (1) `_set_tracking_uri()` was imported but never called, so
+  `MlflowClient()` read an ambient tracking URI instead of this repo's own `mlruns/`.
+  (2) `has_raw_cache` was only assigned inside the `except MlflowException` branch — on a
+  dev machine, where a Production model IS registered, the `try` succeeds and
+  `has_raw_cache` is never assigned, so the final `return has_production_model and
+  has_raw_cache` raised `UnboundLocalError`. That's the exact "ERROR on dev, SKIP in CI"
+  split the review described: dev hits the `UnboundLocalError`, CI's fresh mlruns/ store
+  raises `MlflowException` on the missing registered model, which the `except` branch
+  *does* compute `has_raw_cache` for (False on a fresh checkout), so CI skips cleanly while
+  dev errors. Fixed: call `_set_tracking_uri()` first; compute `has_raw_cache`
+  unconditionally, outside the try/except. Verified: all three M7 tests (retrain trigger,
+  version mismatch, rollback) now pass for real against this dev machine's actual
+  registered model and raw cache — `3 passed`, not skipped or errored.
+- **CI guard — plan conflict surfaced and resolved, not silently picked.** The plan
+  specified an unconditional hard-fail if all M7 tests skip in CI. Checked against reality:
+  CI's ephemeral Postgres only ever gets the `ml` schema (`make db-init`), never `marts`,
+  and `mlruns/`/`data/` are both gitignored — so on CI as it exists today, all three tests
+  WILL always skip, correctly, by the same deliberate scope decision M7's own
+  `decisions.md` entry already documents (building a synthetic marts fixture + a way to
+  bootstrap a fixture Production registration was explicitly deferred as beyond M7's ask).
+  A literal hard-fail guard would make `retrain-trigger-test` permanently red starting
+  immediately, for a known and already-approved limitation — a worse outcome than the
+  silent-pass bug it was meant to fix. Flagged to the user rather than guessed at (per the
+  standing rule against silently resolving spec/reality conflicts); user chose **soft-fail**:
+  the guard step runs with `continue-on-error: true`, so an all-skipped run shows a visible
+  yellow warning in the Actions UI on every run — impossible to mistake for "the M7 tests
+  genuinely passed," which was the actual problem — without turning the pipeline red for a
+  scope decision nobody is asking to revisit this session. If the marts fixture is ever
+  built, this step passes silently like any other with zero further change needed.
+- **Why (vs. alternatives):**
+    - *Hard-fail exactly as specified:* rejected by the user after the conflict was
+      surfaced — see above.
+    - *Build the synthetic marts+registry fixture now, so the tests genuinely run in CI:*
+      rejected — real scope growth (fake marts data satisfying every point-in-time join,
+      plus bypassing `register_model.py`'s real-data reproducibility assertion) well beyond
+      P0-2's 30-minute estimate and beyond what M7's own decisions.md already scoped out.
+      Remains the "real" fix if this is ever prioritized.
+    - *Silently implement the plan's literal guard without flagging the conflict:* rejected
+      — CLAUDE.md's standing rule is to flag spec/reality conflicts explicitly, not
+      quietly resolve them in either direction.
+- **Failure mode:** the soft-fail guard depends on someone actually looking at the yellow
+  warning; a hard failure is unmissable, a soft one is merely visible. That tradeoff was
+  made deliberately in exchange for not permanently breaking the pipeline's headline
+  pass/fail signal over a known limitation — worth revisiting if this project ever needs CI
+  to be a hard release gate rather than a portfolio-demo signal.
+- **Trigger to reconsider:** if the synthetic marts+registry fixture is ever built (making
+  the skip genuinely avoidable), switch this step back to hard-fail — the soft-fail
+  rationale evaporates the moment skipping stops being the CORRECT behavior on this runner.
+- **Scaling story (10x/100x):** unaffected by data volume; this is entirely about CI
+  environment provisioning, not model or dataset scale.
+- **Interview question this maps to:** "How did you catch that a green CI job was actually
+  testing nothing?" — the review found it; the fix makes the dev-machine path assert real
+  behavior (verified: 3/3 pass) and makes the CI-skip path visible instead of invisible,
+  after surfacing (not guessing past) a real conflict between the fix plan and this
+  project's own already-documented scope decisions.
