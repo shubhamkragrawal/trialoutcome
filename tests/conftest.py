@@ -29,17 +29,21 @@ from __future__ import annotations
 
 import pytest
 from mlflow.tracking import MlflowClient
+from mlflow.exceptions import MlflowException
 
 from domains.pharma.monitoring.retrain_trigger import REGISTERED_MODEL_NAME, REPO_ROOT, _set_tracking_uri
 
-
 def _has_real_dev_state() -> bool:
-    _set_tracking_uri()
     client = MlflowClient()
-    has_production_model = bool(client.get_latest_versions(REGISTERED_MODEL_NAME, stages=["Production"]))
-    has_raw_cache = (REPO_ROOT / "data" / "raw_trials_cache.parquet").exists()
+    try:
+        has_production_model = bool(
+            client.get_latest_versions(REGISTERED_MODEL_NAME, stages=["Production"])
+        )
+    except MlflowException:
+        has_production_model = False
+        # has_production_model = bool(client.get_latest_versions(REGISTERED_MODEL_NAME, stages=["Production"]))
+        has_raw_cache = (REPO_ROOT / "data" / "raw_trials_cache.parquet").exists()
     return has_production_model and has_raw_cache
-
 
 @pytest.fixture
 def real_dev_state():
