@@ -22,15 +22,47 @@ class SHAPContributor(BaseModel):
     shap_contribution: float
 
 
+class CoverageGuarantee(BaseModel):
+    """
+    Purpose: Make explicit what `uncertainty_band`'s conformal coverage
+        target actually applies to (M9-9) -- MAPIE's guarantee is on SET
+        MEMBERSHIP of the true label (was the true class inside the
+        predicted {0}/{1}/{0,1} set at the target rate), not on the
+        probability band itself. Before M9-9 this field didn't exist and the
+        band was named `conformal_interval`, which a reader could reasonably
+        (but incorrectly) assume meant a coverage-guaranteed probability
+        interval.
+    Leakage guard: N/A.
+    Failure mode: N/A (plain value container); `empirical` is measured once
+        per training run via MAPIEConformalWrapper.verify_coverage() on TEST
+        and loaded from that run's logged `empirical_coverage` metric, not
+        recomputed at serving time.
+    """
+
+    type: str
+    target: float
+    empirical: float
+    note: str
+
+
 class PredictionResponse(BaseModel):
     """LOCKED CROSS-PROJECT CONTRACT -- see 02_TRIALOUTCOME_SPEC.md Section 6.
     RegIntel's `trial_risk` tool is built against this exact field set and
     these exact names. Do not rename/add/remove fields without flagging it
     and updating RegIntel's tool wrapper in lockstep.
+
+    M9-9 (locked-contract change, coordinated with 01_REGINTEL_SPEC.md in the
+    same session): `conformal_interval` renamed to `uncertainty_band`, and
+    `coverage_guarantee` added, documenting that the coverage target/empirical
+    numbers apply to label-set membership, not to the probability band a
+    reader would otherwise assume `uncertainty_band` promises. See
+    decisions.md M9-9 and 02_TRIALOUTCOME_SPEC.md Section 12 for the
+    rationale.
     """
 
     proba: float
-    conformal_interval: tuple[float, float]
+    uncertainty_band: tuple[float, float]
+    coverage_guarantee: CoverageGuarantee
     threshold_decision: str  # "high_risk" or "low_risk"
     top_shap: list[SHAPContributor]
     plain_english_summary: str

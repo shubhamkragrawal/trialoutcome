@@ -204,8 +204,15 @@ curl localhost:8000/api/v1/predict/nct/NCT05062889
 ```
 
 Both return the locked cross-project contract shape:
-`{proba, conformal_interval, threshold_decision, top_shap, plain_english_summary, feature_pipeline_version}`
+`{proba, uncertainty_band, coverage_guarantee, threshold_decision, top_shap, plain_english_summary, feature_pipeline_version}`
 — this exact shape is what RegIntel's `trial_risk` tool wrapper (Project 4) is built against.
+
+**M9-9 note:** `conformal_interval` was renamed to `uncertainty_band`, and `coverage_guarantee`
+(`{type: "label_set", target: 0.90, empirical: 0.931, note: "..."}`) was added — the field's
+90%-target coverage guarantee is on label-set membership (was the true class inside MAPIE's
+predicted `{0}`/`{1}`/`{0,1}` set), not on the `[low, high]` band itself, and the old name
+implied the latter. Locked-contract change, coordinated with RegIntel's spec in the same
+session — see `docs/decision-log/M9-review-fixes.md` M9-9.
 
 **M9 note:** the request body's `log_enrollment_count` field is now accepted but ignored
 (`enrollment_count` was dropped as target leakage — see above); it is omitted from the

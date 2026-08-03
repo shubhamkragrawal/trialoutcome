@@ -56,9 +56,13 @@ def test_predict_response_schema():
     r = requests.post(f"{BASE_URL}/api/v1/predict", json=SAMPLE_FEATURES)
     assert r.status_code == 200
     body = r.json()
-    # Locked field names -- do not rename without updating RegIntel's tool wrapper
+    # Locked field names -- do not rename without updating RegIntel's tool wrapper.
+    # M9-9: conformal_interval -> uncertainty_band (renamed) + coverage_guarantee
+    # (added) -- locked-contract change, coordinated with 01_REGINTEL_SPEC.md in
+    # the same session, see decisions.md M9-9.
     assert "proba" in body
-    assert "conformal_interval" in body
+    assert "uncertainty_band" in body
+    assert "coverage_guarantee" in body
     assert "threshold_decision" in body
     assert "top_shap" in body
     assert "plain_english_summary" in body
@@ -70,8 +74,13 @@ def test_predict_field_types():
     body = r.json()
     assert isinstance(body["proba"], float)
     assert 0.0 <= body["proba"] <= 1.0
-    assert isinstance(body["conformal_interval"], list)
-    assert len(body["conformal_interval"]) == 2
+    assert isinstance(body["uncertainty_band"], list)
+    assert len(body["uncertainty_band"]) == 2
+    guarantee = body["coverage_guarantee"]
+    assert guarantee["type"] == "label_set"
+    assert 0.0 <= guarantee["target"] <= 1.0
+    assert 0.0 <= guarantee["empirical"] <= 1.0
+    assert isinstance(guarantee["note"], str) and len(guarantee["note"]) > 0
     assert body["threshold_decision"] in ("high_risk", "low_risk")
     assert isinstance(body["top_shap"], list)
     assert len(body["top_shap"]) <= 5
