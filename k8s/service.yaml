@@ -1,0 +1,14 @@
+# ClusterIP -- not exposed outside the cluster by design. Local demo access
+# is via `kubectl port-forward` (see docs/k8s_setup.md), not a real Ingress
+# -- see README's "What I'd change at production scale" section.
+apiVersion: v1
+kind: Service
+metadata:
+  name: trialoutcome-api
+spec:
+  type: ClusterIP
+  selector:
+    app: trialoutcome-api
+  ports:
+    - port: 8000
+      targetPort: 8000
