@@ -22,26 +22,21 @@ from xgboost import XGBClassifier
 
 from core.dataset_builder_base import SplitDates
 from core.training_pipeline import OptunaMLflowTrainer, SplitData
-from domains.pharma.dataset_builder import PharmaDatasetBuilder, feature_pipeline_version
+from domains.pharma.dataset_builder import (
+    CATEGORICAL_FEATURES,
+    NUMERIC_FEATURES,
+    PharmaDatasetBuilder,
+    feature_pipeline_version,
+)
 
 PACKAGE_DIR = Path(__file__).parent
 REPO_ROOT = PACKAGE_DIR.parent.parent
 
-CATEGORICAL_FEATURES = ["phase", "allocation", "masking", "has_dmc_str", "sponsor_class"]
-NUMERIC_FEATURES = [
-    # M9-1: log_enrollment_count / enrollment_missing removed as target
-    # leakage. See config.yaml dropped_features and decisions.md M9-1.
-    "num_primary_outcomes",
-    "num_sites",
-    "has_results",
-    "eligibility_criteria_length",
-    "exclusion_keyword_count",
-    "sponsor_prior_trial_count",
-    "sponsor_prior_termination_rate",
-    "condition_rarity",
-    "start_year",
-    "start_quarter",
-]
+# M9-13: CATEGORICAL_FEATURES/NUMERIC_FEATURES moved to dataset_builder.py so
+# domains/pharma/serving/api.py can import them without also importing this
+# module's training-only optuna/lightgbm dependencies -- see that file's
+# comment and decisions.md M9-13. Imported back here (not redefined) so
+# there is still exactly one definition.
 N_TRIALS_PER_FAMILY = 8
 ABLATION_TEST_WINDOW = (pd.Timestamp("2020-01-01"), pd.Timestamp("2022-01-01"))
 CONDITION_TOP_N = 20
