@@ -1,6 +1,16 @@
-"""Integration tests for the LOCKED CROSS-PROJECT CONTRACT (TrialOutcome M5,
-spec Section 6). RegIntel's `trial_risk` tool depends on this exact response
-shape -- these tests validate the shape, not model quality.
+"""End-to-end integration tests for the LOCKED CROSS-PROJECT CONTRACT
+(TrialOutcome M5, spec Section 6), run against a REAL running Docker
+container and the real Production MLflow model. RegIntel's `trial_risk` tool
+depends on this exact response shape -- these tests validate the shape, not
+model quality.
+
+M9-14: this file never ran in CI (no Docker container available there) --
+renamed from tests/test_api_contract.py to make that explicit, and kept
+around for local end-to-end verification against the real Production model.
+See tests/test_api_contract.py for the CI-safe TestClient-based rewrite that
+now runs in the test-unit CI job (fast, no Docker, no live Postgres, a tiny
+synthetic-data fixture model instead of the real MLflow registry) -- and
+decisions.md M9-14 for why both files exist rather than just one.
 
 Requires the API to be running first: `make serve` (or a local uvicorn run),
 then `make test-api`.
