@@ -183,6 +183,21 @@ class MAPIEConformalWrapper:
             checking coverage on the same data it was calibrated on would
             be circular and not a genuine generalization check).
         Failure mode: Raises RuntimeError if called before fit_conformal().
+
+        M9-21: `passed`'s tolerance is now derived from `self.target_coverage`
+            (`target_coverage - 0.02`) instead of a hardcoded `0.88` -- a
+            silent coupling the review flagged (§2.10): `0.88` is only
+            correct for the specific `target_coverage=0.90` this project has
+            always used; a future `MAPIEConformalWrapper(target_coverage=0.95)`
+            would have kept the old hardcoded `0.88` gate, silently passing a
+            run that under-covers its own target by 5pp instead of 2pp. No
+            behavior change at today's target_coverage=0.90 (0.90 - 0.02 =
+            0.88 exactly). Also added an OVER-coverage warning
+            (`empirical > target_coverage + 0.05`): coverage well above
+            target isn't a bug, but it does mean MAPIE's quantile is wider
+            than it needs to be -- an uninformatively wide interval that
+            technically "passes" the under-coverage gate while providing
+            less signal than a tighter, still-valid one would.
         """
         if self.mapie_ is None:
             raise RuntimeError(
@@ -194,7 +209,22 @@ class MAPIEConformalWrapper:
         sets = pred_sets[:, :, 0]
         in_set = sets[np.arange(len(y_test_arr)), y_test_arr]
         empirical = float(in_set.mean())
-        passed = empirical >= 0.88
-        result = {"target": self.target_coverage, "empirical": empirical, "passed": passed}
+        under_coverage_tolerance = self.target_coverage - 0.02
+        over_coverage_threshold = self.target_coverage + 0.05
+        passed = empirical >= under_coverage_tolerance
+        over_covered = empirical > over_coverage_threshold
+        result = {
+            "target": self.target_coverage,
+            "empirical": empirical,
+            "passed": passed,
+            "over_covered": over_covered,
+        }
         print(f"Conformal coverage: {empirical:.3f} (target {self.target_coverage:.2f})")
+        if over_covered:
+            print(
+                f"WARNING: empirical coverage {empirical:.3f} exceeds target "
+                f"{self.target_coverage:.2f} by more than 5pp -- intervals are "
+                "wider than necessary to hit the target coverage, trading away "
+                "informativeness for a margin nobody asked for."
+            )
         return result
