@@ -54,8 +54,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install uv
+        run: pip install uv
+
+      - name: Sync dependencies (uv.lock)
+        # M9-13: matches lint-and-type-check's and drift-check's own
+        # `uv sync --frozen` -- was `pip install -r requirements.txt`, a
+        # second, hand-maintained dependency path that could (and did) drift
+        # from uv.lock. requirements.txt is now a generated courtesy export
+        # only (`make export-requirements`), not something any CI job or the
+        # Dockerfile installs from anymore -- see decisions.md M9-13.
+        run: uv sync --frozen
 
       - name: Run unit tests with coverage floor
         # M9-12: 25% is a non-regression tripwire, not a target -- measured
@@ -67,8 +76,11 @@ jobs:
         # this job's fast suite doesn't run. Raising this meaningfully
         # (60-80%) requires writing new fast unit tests for those modules --
         # out of scope for this fix, tracked as a P1/P2 follow-up.
+        # M9-13: `uv run` (not bare `pytest`) -- `uv sync` above installs into
+        # an isolated .venv/, not onto PATH, same reasoning as the
+        # retrain-trigger-test job's identical uv run pytest below.
         run: |
-          pytest tests/ -v --ignore=tests/test_api_contract.py \
+          uv run pytest tests/ -v --ignore=tests/test_api_contract_e2e.py \
             --cov=core --cov=domains --cov-report=term-missing --cov-fail-under=25
 
   drift-check:

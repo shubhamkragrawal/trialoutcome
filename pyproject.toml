@@ -3,28 +3,44 @@ name = "trialoutcome"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
+# M9-13: this is now the SERVING dependency set -- exactly what
+# domains/pharma/serving/api.py's import graph needs to load the Production
+# model and answer /predict, and nothing else. Everything training/notebook/
+# lint-only lives in [dependency-groups] dev below; `Dockerfile` installs
+# this list alone (`uv sync --frozen --no-dev`), so anything added here grows
+# the served image. See docs/decision-log/M9-review-fixes.md M9-13 for two
+# corrections against the fix plan's literal serving list:
+#   - shap is REQUIRED here, not dev-only as the plan proposed -- every
+#     /predict response's `top_shap` field (part of the locked cross-project
+#     contract) is computed via shap.TreeExplainer on the live request.
+#   - lightgbm is DROPPED from serving (the plan's list included it) -- it
+#     was only ever reachable through api.py's now-removed import of
+#     train_pipeline.py (see dataset_builder.py's CATEGORICAL_FEATURES
+#     comment); the Production model is always XGBoost (register_model.py
+#     hardcodes it) and nothing serving-side touches LightGBM.
+# pyyaml and python-dotenv are also serving-required (config.yaml load and
+# _get_engine's load_dotenv call, both hit during _load_bundle()) -- present
+# in the plan's original undifferentiated dependency list but omitted from
+# its literal serving/dev split.
 dependencies = [
-    "evidently>=0.7.21",
     "fastapi>=0.141.1",
-    "httpx>=0.28.1",
-    "ipykernel>=7.3.0",
-    "jupyterlab>=4.6.2",
-    "lightgbm>=4.7.0",
     "mapie>=1.4.1",
-    "matplotlib>=3.11.1",
+    # M9-20: <3.0 ceiling is the documented mitigation for mlflow's model-
+    # registry "stages" FutureWarning (this codebase uses stage="Production"/
+    # "Staging"/"Archived" throughout register_model.py, retrain_trigger.py,
+    # rollback.py). Deliberately not migrated to the alias-based API this
+    # session -- see docs/decision-log/M9-review-fixes.md M9-20 for the full
+    # decision (why not now, the one-day migration path when it is time, and
+    # the trigger condition that would force it).
     "mlflow>=2.14,<3.0",
-    "nbconvert>=7.17.1",
     "numpy>=2.4.6",
-    "optuna>=4.9.0",
     "pandas<3",
+    "prometheus-fastapi-instrumentator>=7.1.0",
     "psycopg2-binary>=2.9.12",
-    "pyarrow>=14,<20",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
-    "requests>=2.34.2",
     "scikit-learn>=1.9.0",
-    "seaborn>=0.13.2",
     "shap>=0.48,<0.52",
     "sqlalchemy>=2.0.51",
     "uvicorn[standard]>=0.52.0",
@@ -32,12 +48,28 @@ dependencies = [
 ]
 
 [dependency-groups]
+# Training pipeline, notebooks, monitoring/retrain scripts, and CI tooling --
+# never installed into the served API image. `make train`/`make drift`/
+# `make register-model`/`make check-drift-retrain` all run via `uv run`
+# outside Docker (see docker-compose.yml -- the only service it defines is
+# trialoutcome-api), so it's safe for these to be dev-only.
 dev = [
+    "evidently>=0.7.21",
+    "httpx>=0.28.1",
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.2",
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.1",
     "mypy>=2.3.0",
+    "nbconvert>=7.17.1",
+    "optuna>=4.9.0",
     "pandas-stubs>=3.0.5.260730",
+    "pyarrow>=14,<20",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
+    "requests>=2.34.2",
     "ruff>=0.16.1",
+    "seaborn>=0.13.2",
 ]
 
 [tool.ruff]
