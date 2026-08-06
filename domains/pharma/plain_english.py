@@ -153,6 +153,31 @@ def _humanize_decision(threshold_decision: str) -> str:
     return _DECISION_LABELS.get(threshold_decision, threshold_decision)
 
 
+def _format_probability(proba: float) -> str:
+    """
+    Purpose: Render `proba` as the headline percentage in generate_summary's
+        sentence, without ever printing the literal "100%" or "0%" -- both
+        read as false certainty to a stakeholder ("100% termination
+        probability" is not a sentence a Clinical Operations VP will accept
+        at face value, however well-calibrated the underlying number is).
+    Leakage guard: N/A.
+    Failure mode: Only the two rounding-to-an-extreme cases are special-
+        cased (M9-18); every other value formats exactly as before
+        (`f"{proba:.0%}"`). api.py's `_predict_from_row` already clips proba
+        to [0.001, 0.999] before this is ever called, so a genuine 0.0/1.0
+        should never reach here -- this function's own thresholds
+        (>=0.995 / <0.005) are the "would this DISPLAY as 100%/0% under
+        plain :.0% rounding" boundary, not the clip boundary itself, so it
+        stays correct even if a caller (a test, a notebook) passes an
+        unclipped value.
+    """
+    if proba >= 0.995:
+        return "at least 99%"
+    if proba < 0.005:
+        return "less than 1%"
+    return f"{proba:.0%}"
+
+
 def _partition_by_direction(
     top_shap_contributors: list[dict],
 ) -> tuple[list[dict], list[dict]]:
@@ -230,7 +255,7 @@ def generate_summary(
 
     summary = (
         f"This trial is flagged {_humanize_decision(threshold_decision)} "
-        f"({proba:.0%} estimated termination probability) {reason_text}."
+        f"({_format_probability(proba)} estimated termination probability) {reason_text}."
     )
     if opposing:
         summary += f" {opposing_label}: {_describe_contribution(opposing[0])}."
