@@ -11,6 +11,7 @@ hyperparameters procedure M3/M4 already validated (assert PR-AUC matches to
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import mlflow
@@ -24,6 +25,7 @@ from xgboost import XGBClassifier
 
 from core.calibration import expected_calibration_error
 from core.dataset_builder_base import SplitDates
+from core.logging_utils import configure_json_logging
 from domains.pharma.dataset_builder import PharmaDatasetBuilder, feature_pipeline_version
 from domains.pharma.train_pipeline import (
     CATEGORICAL_FEATURES,
@@ -33,6 +35,9 @@ from domains.pharma.train_pipeline import (
     _fit_condition_vocab,
     _make_preprocessor,
 )
+
+configure_json_logging()
+logger = logging.getLogger(__name__)
 
 EXPERIMENT_NAME = "trialoutcome_m2"
 REGISTERED_MODEL_NAME = "trialoutcome_xgb_calibrated"
@@ -97,7 +102,7 @@ def main() -> None:
     train = temporal[temporal["split"] == "train"]
     calib = temporal[temporal["split"] == "calib"]
     test = temporal[temporal["split"] == "test"]
-    print(f"train={len(train)}  calib={len(calib)}  test={len(test)}")
+    logger.info("train=%d  calib=%d  test=%d", len(train), len(calib), len(test))
 
     # --- Refit the XGBoost champion on TRAIN only, verify it reproduces the
     # logged M2 run exactly (same procedure M3/M4 used) before calibrating.
@@ -115,8 +120,10 @@ def main() -> None:
     proba_test_raw = xgb_pipeline.predict_proba(test[feature_cols])[:, 1]
     pr_check = float(average_precision_score(test["label"], proba_test_raw))
     roc_check = float(roc_auc_score(test["label"], proba_test_raw))
-    print(
-        f"Refit sanity check -- pr_auc_temporal={pr_check:.6f} (expected {EXPECTED_PR_AUC_TEMPORAL:.6f})"
+    logger.info(
+        "Refit sanity check -- pr_auc_temporal=%.6f (expected %.6f)",
+        pr_check,
+        EXPECTED_PR_AUC_TEMPORAL,
     )
     assert abs(pr_check - EXPECTED_PR_AUC_TEMPORAL) < 1e-6, (
         f"refit pr_auc_temporal={pr_check:.6f} != M9 baseline "
@@ -124,7 +131,7 @@ def main() -> None:
         "re-baseline this constant without confirming enrollment_count has not "
         "come back into the feature set (see decisions.md M9-1)."
     )
-    print("Refit reproduces the M9 no-enrollment baseline exactly.")
+    logger.info("Refit reproduces the M9 no-enrollment baseline exactly.")
 
     # --- Wrap the already-fitted pipeline with sklearn's CalibratedClassifierCV
     # in isotonic mode, fit on CALIB only. NOTE (deviation from the M5 spec's
@@ -142,15 +149,15 @@ def main() -> None:
     proba_test_calibrated = calibrated_pipeline.predict_proba(test[feature_cols])[:, 1]
     ece_test, _ = expected_calibration_error(test["label"].to_numpy(), proba_test_calibrated)
     pr_auc_calibrated = float(average_precision_score(test["label"], proba_test_calibrated))
-    print(f"Calibrated TEST ECE={ece_test:.4f}  PR-AUC={pr_auc_calibrated:.4f}")
+    logger.info("Calibrated TEST ECE=%.4f  PR-AUC=%.4f", ece_test, pr_auc_calibrated)
 
+    # M9-16: feature_pipeline_version() is now a sha256 content hash of the
+    # three pipeline-defining files, not a git hash -- it can no longer
+    # return "unknown" (that was specifically a git-lookup-failed fallback),
+    # so the dead "commit the repo first" warning this used to print is gone
+    # too. See dataset_builder.py's feature_pipeline_version docstring.
     version = feature_pipeline_version()
-    print(f"feature_pipeline_version = {version}")
-    if version == "unknown":
-        print(
-            "WARNING: feature_pipeline_version is still 'unknown' -- commit the repo "
-            "before treating this run as the real production record."
-        )
+    logger.info("feature_pipeline_version = %s", version)
 
     mlflow.set_tracking_uri(f"file:{REPO_ROOT / 'mlruns'}")
     mlflow.set_experiment(EXPERIMENT_NAME)
@@ -185,6 +192,19 @@ def main() -> None:
             "feature_schema.json",
         )
 
+        # M9-15: log the RAW fitted xgb_pipeline (pre-CalibratedClassifierCV)
+        # as its own artifact, separate from "model" (the calibrated one
+        # predict_proba actually serves). Before this, api.py's SHAP
+        # TreeExplainer reached for the raw pipeline via
+        # `calibrated_model.calibrated_classifiers_[0].estimator.estimator`
+        # -- three layers of CalibratedClassifierCV/FrozenEstimator private
+        # attributes with no compatibility guarantee across sklearn minor
+        # versions. Logging it directly here means api.py's _load_bundle()
+        # can `mlflow.sklearn.load_model(f"runs:/{run_id}/raw_pipeline")`
+        # instead -- a public, versioned MLflow artifact API call, not a
+        # private-attribute chain that breaks silently on the next sklearn
+        # bump. See decisions.md M9-15.
+        mlflow.sklearn.log_model(xgb_pipeline, artifact_path="raw_pipeline")
         mlflow.sklearn.log_model(
             calibrated_pipeline,
             artifact_path="model",
@@ -210,12 +230,17 @@ def main() -> None:
             client.transition_model_version_stage(
                 name=REGISTERED_MODEL_NAME, version=v.version, stage="Archived"
             )
-            print(f"Archived previous Production version {v.version}")
+            logger.info("Archived previous Production version %s", v.version)
 
     client.transition_model_version_stage(
         name=REGISTERED_MODEL_NAME, version=this_version, stage="Production"
     )
-    print(f"Registered {REGISTERED_MODEL_NAME} version {this_version} (run {run_id}) -> Production")
+    logger.info(
+        "Registered %s version %s (run %s) -> Production",
+        REGISTERED_MODEL_NAME,
+        this_version,
+        run_id,
+    )
 
 
 if __name__ == "__main__":

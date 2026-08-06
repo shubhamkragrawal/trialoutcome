@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from sqlalchemy import text
 
@@ -31,9 +32,8 @@ from core.serving.api_base import (
     SHAPContributor,
     build_base_router,
 )
-from domains.pharma.dataset_builder import PharmaDatasetBuilder
+from domains.pharma.dataset_builder import CATEGORICAL_FEATURES, PharmaDatasetBuilder
 from domains.pharma.plain_english import generate_summary
-from domains.pharma.train_pipeline import CATEGORICAL_FEATURES
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REGISTERED_MODEL_NAME = "trialoutcome_xgb_calibrated"
@@ -159,6 +159,10 @@ def _load_bundle() -> _PharmaModelBundle:
 
     calibrated_model = mlflow.sklearn.load_model(f"models:/{REGISTERED_MODEL_NAME}/Production")
     conformal_wrapper = mlflow.sklearn.load_model(f"runs:/{mv.run_id}/conformal")
+    # M9-15: loaded as its own artifact (see register_model.py) instead of
+    # reached for via calibrated_model.calibrated_classifiers_[0].estimator.estimator
+    # -- see the git history of this line for what that looked like.
+    xgb_pipeline = mlflow.sklearn.load_model(f"runs:/{mv.run_id}/raw_pipeline")
 
     feature_schema = mlflow.artifacts.load_dict(f"runs:/{mv.run_id}/feature_schema.json")
     condition_vocab = mlflow.artifacts.load_dict(f"runs:/{mv.run_id}/condition_vocab.json")
@@ -170,11 +174,10 @@ def _load_bundle() -> _PharmaModelBundle:
         f"runs:/{mv.run_id}/imputation_constants.json"
     )
 
-    # Unwrap CalibratedClassifierCV(estimator=FrozenEstimator(xgb_pipeline))
-    # to get back the raw fitted Pipeline([("pre", ColumnTransformer), ("clf",
-    # XGBClassifier)]) -- needed for SHAP (TreeExplainer wants the raw
-    # booster, not the calibration wrapper).
-    xgb_pipeline = calibrated_model.calibrated_classifiers_[0].estimator.estimator
+    # xgb_pipeline (loaded above from its own "raw_pipeline" artifact) is the
+    # raw fitted Pipeline([("pre", ColumnTransformer), ("clf", XGBClassifier)])
+    # -- needed for SHAP (TreeExplainer wants the raw booster, not the
+    # calibration wrapper).
     shap_explainer = SHAPExplainer(xgb_pipeline.named_steps["clf"])
 
     config = yaml.safe_load((REPO_ROOT / "domains/pharma/config.yaml").read_text())
@@ -220,6 +223,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TrialOutcome API", lifespan=lifespan)
 app.include_router(build_base_router(state))
+# M9-17: /metrics -- standard request-count/latency-histogram instrumentation
+# (per-route, per-status-code) in Prometheus text format. Nothing scrapes it
+# in this project today (no traffic to monitor yet, same honest state M9-7's
+# prediction_log entry already documents for drift) -- it exists so the
+# surface is real for "what would you monitor in production" rather than a
+# claim with nothing backing it.
+Instrumentator().instrument(app).expose(app)
 
 
 @app.middleware("http")
@@ -436,7 +446,15 @@ def _log_prediction_background(
 
 def _predict_from_row(row_df: pd.DataFrame, b: _PharmaModelBundle) -> PredictionResponse:
     proba_arr = b.calibrated_model.predict_proba(row_df[b.feature_cols])[:, 1]
-    proba = float(proba_arr[0])
+    # M9-18: clip before anything downstream (threshold decision, SHAP
+    # summary, the served response) reads it -- an isotonic calibrator can
+    # legitimately output exactly 0.0 or 1.0 at the extremes of its training
+    # range, and "100% termination probability" / "0% termination
+    # probability" is a string no stakeholder reading this API's output will
+    # accept at face value, however well-calibrated the number actually is.
+    # See plain_english.py's _format_probability for the matching "at least
+    # 99%" / "less than 1%" prose treatment.
+    proba = float(np.clip(proba_arr[0], 0.001, 0.999))
 
     _, intervals = b.conformal_wrapper.predict_with_interval(row_df[b.feature_cols])
     uncertainty_band = intervals[0]
