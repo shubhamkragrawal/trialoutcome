@@ -124,32 +124,38 @@ dropped_features:
 
 # --- Missingness policy -------------------------------------------------------
 # Null rates printed to stdout at build time (see PharmaDatasetBuilder.build_features).
-# Rates below measured against the Phase2/3 + label-eligible filtered set (2026-07-30, n=79,334):
+# M9-21: re-measured against data/raw_trials_cache.parquet's CURRENT n=78,260
+# (the M9-11 rebuild's row count -- see decisions.md M9-11) -- the n=79,334
+# baseline these rates were originally computed against (2026-07-30, before
+# M9-1's enrollment_count removal and M9-11's sponsor-history rebuild both
+# changed which rows the cache contains) had drifted stale. Recomputed
+# directly against the parquet cache, not estimated by rescaling the old
+# ratios.
 missingness_policy:
   # enrollment_count's policy (impute_median + enrollment_missing indicator)
   # was removed in M9 -- the column is no longer a feature. See
   # dropped_features above.
   num_primary_outcomes:
-    null_rate_observed: 0.0439   # 3,484 / 79,334
+    null_rate_observed: 0.0350   # 2,737 / 78,260
     strategy: impute_median
   num_sites:
-    null_rate_observed: 0.0876   # 6,954 / 79,334
+    null_rate_observed: 0.0841   # 6,584 / 78,260
     strategy: impute_median
   allocation:
-    null_rate_observed: 0.0274   # 2,176 / 79,334 (NULL or blank)
+    null_rate_observed: 0.0219   # 1,715 / 78,260 (NULL or blank)
     strategy: sentinel
     sentinel_value: unknown
   masking:
-    null_rate_observed: 0.0280   # 2,219 / 79,334 (NULL or blank)
+    null_rate_observed: 0.0231   # 1,811 / 78,260 (NULL or blank)
     strategy: sentinel
     sentinel_value: unknown
   has_dmc:
-    null_rate_observed: 0.2164   # 17,169 / 79,334
+    null_rate_observed: 0.2076   # 16,248 / 78,260
     strategy: sentinel           # tri-state categorical, NOT imputed to a mode --
-                                  # 21.6% null is too high to collapse into true/false
+                                  # ~21% null is too high to collapse into true/false
     sentinel_value: unknown
   eligibility_criteria:
-    null_rate_observed: 0.0003   # 24 / 79,334
+    null_rate_observed: 0.0002   # 18 / 78,260
     strategy: impute_empty_string   # -> criteria_length=0, exclusion_keyword_count=0
   sponsor_prior_termination_rate:
     strategy: impute_median      # NULL for sponsors with no prior trials (new sponsors)

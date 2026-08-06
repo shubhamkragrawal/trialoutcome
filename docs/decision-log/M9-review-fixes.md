@@ -949,3 +949,603 @@ plus a broader case-insensitive `\b(prompt|brief|DoD)\b` scan both return zero h
   despite the name"). After it: "`uncertainty_band`'s `coverage_guarantee`
   field says so directly — label-set membership, 90% target, 93.1% empirical
   on TEST, not a promise about the probability band."
+
+---
+
+# P2 — Polish
+
+## Decision (review-driven, P2): serving/dev dependency split; plan's literal serving list corrected on two counts, not followed verbatim
+
+- **What:** Split `pyproject.toml`'s single `dependencies` list into
+  `[project.dependencies]` (serving — installed by the Docker image) and
+  `[dependency-groups] dev` (training/notebooks/CI tooling — never shipped).
+  Added `make export-requirements` (`uv export --no-dev --no-hashes --format
+  requirements.txt`) so `requirements.txt` is a generated courtesy artifact,
+  not hand-edited; nothing in the repo's own tooling reads it anymore
+  (Dockerfile and every CI job use `uv sync --frozen[--no-dev]` directly
+  against `uv.lock`).
+- **The plan's literal serving list was wrong on two counts, corrected
+  rather than followed as written:**
+    - **`shap` belongs in serving, not dev.** The plan put it in the dev
+      group. Every `/predict` response's `top_shap` field — part of the
+      LOCKED cross-project contract — is computed via `shap.TreeExplainer`
+      on the live request inside `_top_shap_contributors()`; without it the
+      API cannot answer a single prediction. `pyyaml`/`python-dotenv` were
+      similarly missing from the plan's literal list despite being read at
+      every `_load_bundle()` call (`config.yaml`'s threshold,
+      `_get_engine()`'s `load_dotenv`).
+    - **`lightgbm` does NOT belong in serving, though the plan listed it.**
+      Root cause: `api.py` imported `CATEGORICAL_FEATURES` from
+      `train_pipeline.py` purely for `_original_feature_of()`'s SHAP
+      aggregation — and `train_pipeline.py` imports `optuna` and
+      `lightgbm` at module level for its 4-model-family Optuna sweep, so
+      merely importing `api.py` silently pulled both training-only
+      packages into the servable graph (the Dockerfile's own pre-existing
+      `libgomp1` comment already flagged the LightGBM half of this as a
+      known wart, without tracing it to its actual cause). Fixed the root
+      cause instead of accepting the transitive cost: moved
+      `CATEGORICAL_FEATURES`/`NUMERIC_FEATURES` to `dataset_builder.py`
+      (already a hard serving dependency, imports neither package) and had
+      `train_pipeline.py` import them back from there — one definition,
+      still. Verified via `sys.modules` inspection after `import
+      domains.pharma.serving.api`: neither `optuna` nor `lightgbm` loads.
+      `xgboost` itself still needs `libgomp1` (OpenMP), so that apt package
+      stays; the Dockerfile comment was corrected to say so rather than
+      still blaming LightGBM.
+- **Measured image-size delta:** `docker image inspect`/`docker images`
+  reported the *new* image as larger (938MB→1.5GB via `.Size`, 3.55GB→5.12GB
+  via `docker images`) — a red herring from the containerd image store's
+  attestation/manifest-list accounting under BuildKit, not actual shipped
+  content (confirmed both builds independently emit an attestation
+  manifest). The number that reflects what's actually on disk is `du -sh /`
+  inside each running container: **2.5GB → 1.8GB, a 28% reduction**
+  (`/usr/local/lib/python3.11/site-packages` 2.3GB → `/app/.venv/.../site-
+  packages` 1.5GB). Breakdown confirmed jupyterlab/evidently/optuna/
+  matplotlib*/seaborn/nbconvert/ipykernel/plotly/statsmodels/jedi/debugpy/
+  babel are gone from the image (*mlflow itself pulls matplotlib back in
+  transitively — unavoidable without dropping mlflow, not a leak in this
+  split). One line item dominates what's left either way and is unaffected
+  by this fix: `nvidia-nccl-cu12` (401MB, an XGBoost-on-Linux wheel
+  dependency for multi-GPU training, useless for CPU inference) was present
+  at the same size in the BEFORE image too — not introduced by this change,
+  flagged as a real future-revisit (`uv`'s `override-dependencies` could
+  plausibly strip it) rather than attempted in this session.
+- **Why (vs. alternatives):**
+    - *Follow the plan's literal serving/dev split verbatim:* rejected —
+      would have shipped an API that 500s on its first `/predict` call
+      (missing shap) while still carrying lightgbm's dead weight; the whole
+      point of a leanness fix is defeated by keeping an admittedly-unused
+      package because a document said to.
+    - *Accept the optuna/lightgbm transitive cost rather than move two
+      constant lists:* rejected — the fix is two lines moved plus updated
+      imports in three files, materially smaller than the packages it
+      removes from the image.
+- **Failure mode:** if a future PR adds a new `domains.pharma.serving.api`
+  import of anything under `train_pipeline.py` (or any other dev-group-only
+  module), the optuna/lightgbm exclusion silently regresses — nothing
+  currently tests "the servable import graph stays free of dev-only
+  packages" as an ongoing invariant; `sys.modules` inspection was a
+  one-time manual check, not a CI gate.
+- **Scaling story (10x/100x):** dependency count doesn't scale with
+  row/model volume — this is a one-time footprint fix. The nvidia-nccl-cu12
+  finding is the one line item that WOULD matter at higher request volume
+  (larger image → slower cold starts/autoscaling in a K8s context), and is
+  exactly the kind of thing worth revisiting if this project's Docker image
+  is ever actually deployed at scale rather than run locally.
+- **Interview question this maps to:** "How did you keep your serving image
+  lean?" — the honest answer includes the shap/lightgbm correction as the
+  interesting part: a plan document's dependency split isn't automatically
+  correct, and tracing WHY a training-only package was reachable from the
+  API (one transitively-imported constant) is a more defensible answer than
+  reciting a package list.
+
+## Decision (review-driven, P2): `test_api_contract.py` rewritten against TestClient with a real (tiny) fitted model, not a mock
+
+- **What:** Renamed the Docker-dependent `test_api_contract.py` to
+  `test_api_contract_e2e.py` (kept for local end-to-end verification against
+  the real Production model via `make test-api`). The new
+  `test_api_contract.py` runs against `fastapi.testclient.TestClient`
+  directly, all 8 of the original file's tests (health, ready, predict
+  schema, field types, threshold applied, nct found, nct not found, missing
+  features 422 — the spec's own "7 vs 8" miscount, already noted in Section
+  12's M5 row, is unchanged here), no Docker, no live Postgres, no real
+  MLflow registry. Added to the `test-unit` CI job (the `--ignore` flag
+  moved from `test_api_contract.py` to `test_api_contract_e2e.py`).
+- **Fixture choice: a real tiny fitted pipeline, not a mock.** The fix
+  plan's own text allowed either "mock the model bundle or use a tiny
+  fixture model." Chose the latter: `_build_fixture_bundle()` fits a real
+  `XGBClassifier` + `CalibratedClassifierCV(FrozenEstimator(...))` +
+  `MAPIEConformalWrapper` + `SHAPExplainer` on ~120 rows of synthetic data
+  shaped exactly like `PharmaDatasetBuilder.build_features()`'s output,
+  mirroring `register_model.py`'s own procedure at toy scale. A
+  `_FakeEngine`/`_FakeConnection` pair stands in for the one SQL query
+  `/predict/nct/{id}` issues (and no-ops the prediction-log INSERT). Every
+  route under test exercises the REAL prediction path — preprocessing,
+  calibration, conformal interval math, SHAP aggregation, plain-English
+  templating — not a hand-stubbed response shape that could drift from what
+  the real bundle actually produces without a test noticing.
+- **Why (vs. alternatives):**
+    - *Mock `calibrated_model.predict_proba`/`conformal_wrapper.predict_with_interval`
+      directly:* rejected — would test that the route calls a mock
+      correctly, not that `_predict_from_row`'s actual math (SHAP
+      aggregation, conformal interval construction, plain-English
+      partitioning) produces a valid response; a refactor that silently
+      broke the real pipeline could still pass.
+    - *Load the real Production MLflow model in CI:* rejected — the plan
+      explicitly anticipated this failing on a fresh checkout (no
+      `mlruns/`), which is exactly CI's situation; a fixture model is the
+      documented fallback.
+- **Failure mode:** the fixture's synthetic data has no real relationship
+  between features and label (label is a threshold on one column) — these
+  tests validate response SHAPE and plumbing, not model quality; a
+  regression in prediction *accuracy* would not be caught here (nor should
+  it be — that's TEST-split PR-AUC's job, not a contract test's).
+- **Scaling story (10x/100x):** the fixture model trains in ~1 second on
+  every test run (10 XGBoost estimators, 80 rows) — irrelevant to
+  production row/model scale, since it never touches real data.
+- **Interview question this maps to:** "Your contract tests need a model —
+  where do you get one in CI without the real registry?" — a tiny, genuinely
+  fitted model beats a mock because it can't silently drift from what the
+  real prediction path actually does.
+
+## Decision (review-driven, P2): raw XGBoost pipeline logged as its own MLflow artifact; api.py no longer reaches through three layers of sklearn private attributes
+
+- **What:** `register_model.py` now logs `xgb_pipeline` (the raw fitted
+  pipeline, pre-`CalibratedClassifierCV`) as its own artifact
+  (`mlflow.sklearn.log_model(xgb_pipeline, artifact_path="raw_pipeline")`)
+  on every future registration run, alongside the existing `model`
+  (calibrated) artifact. `api.py`'s `_load_bundle()` now loads it directly
+  (`mlflow.sklearn.load_model(f"runs:/{mv.run_id}/raw_pipeline")`) instead
+  of reaching for `calibrated_model.calibrated_classifiers_[0].estimator.estimator`
+  — three layers of `CalibratedClassifierCV`/`FrozenEstimator` private
+  attributes with no cross-sklearn-version compatibility guarantee.
+- **Backfilled onto the existing v45 Production run, no new registry
+  version:** extracted `xgb_pipeline` from the currently-loaded calibrated
+  model via the old private-attribute chain ONE more time (the only
+  remaining legitimate use of it in this codebase) and re-logged it onto
+  v45's existing run (`aa8ec5b5710b490d9b0963b15476bad0`) via
+  `mlflow.start_run(run_id=...)`. Verified end-to-end against the real
+  Production model afterward: `_load_bundle()` loads successfully, and a
+  live docker-compose `/predict` call (see M9-19 entry) returns a correct,
+  fully-populated response including `top_shap` — confirming the new load
+  path produces a working `SHAPExplainer` just like the old one did.
+- **Why (vs. alternatives):**
+    - *Leave api.py's private-attribute reach and only fix it on the next
+      unrelated retrain:* rejected — the whole point is removing a
+      sklearn-version-bump timebomb before it fires, not after.
+    - *Retrain to get a clean v46 with the artifact logged the normal way:*
+      rejected — no model or feature change is involved; forcing a retrain
+      (and a new registry version) for a pure serving-robustness fix would
+      be scope creep on a model that hasn't changed.
+- **Failure mode:** any FUTURE retrain that doesn't go through
+  `register_model.py`'s `main()` (a hand-rolled MLflow run, say) would need
+  to remember to log `raw_pipeline` too, or `_load_bundle()`'s
+  `mlflow.sklearn.load_model(f"runs:/{mv.run_id}/raw_pipeline")` raises a
+  clean `MlflowException` (artifact not found) — a loud failure at startup,
+  not a silent misbehavior, but still a manual step someone could forget.
+- **Scaling story (10x/100x):** one extra `log_model` call per training
+  run — irrelevant to row/model scale, a fixed one-time cost per retrain.
+- **Interview question this maps to:** "What happens to your serving code
+  when sklearn ships a minor version bump?" — before this fix, the honest
+  answer was "hope `CalibratedClassifierCV`'s internal attribute names
+  didn't change"; after it, "the raw pipeline is its own versioned MLflow
+  artifact, loaded through the public `mlflow.sklearn.load_model` API, not
+  a private attribute chain."
+
+## Decision (review-driven, P2): `feature_pipeline_version()` widened to a content hash of all three pipeline-defining files
+
+- **What:** Replaced `git rev-list -1 HEAD -- dataset_builder.py` (a
+  single-file git hash) with a sha256 content hash of
+  `dataset_builder.py` + `train_pipeline.py` + `config.yaml`'s concatenated
+  bytes (`_PIPELINE_FILES`, hashed in `feature_pipeline_version()`). Fixes
+  two blind spots the review flagged (§2.9): (1) a change to
+  `train_pipeline.py`'s `CATEGORICAL_FEATURES`/`NUMERIC_FEATURES` or
+  `config.yaml`'s missingness policy/dropped features/split dates moved
+  neither the old hash nor M7's version-mismatch check, even though both
+  files define real pipeline behavior; (2) `.dockerignore` excludes
+  `.git/`, so `git rev-list` silently returned `"unknown"` for any run
+  trained inside a container — this function can no longer return
+  `"unknown"` at all (that was specifically a git-lookup-failure fallback),
+  so `register_model.py`'s now-dead "commit the repo first" warning was
+  removed too. Added `tests/test_feature_pipeline_version.py` (5 tests, no
+  DB/MLflow dependency, `_PIPELINE_FILES` monkeypatched to `tmp_path`
+  throwaway files): hash changes when any of the three files changes,
+  stays stable when a fourth/unrelated file changes, deterministic for
+  identical content.
+- **Deliberate behavior change, named explicitly:** unlike the old git
+  hash (which only moved on commit), this ALSO changes on uncommitted
+  edits to any of the three files. Per the fix plan's own framing: "this
+  hash covers uncommitted edits too, which git rev-list cannot — that's a
+  feature, not a bug." A training run against dirty working-tree state
+  should be tagged as such, not silently attributed to the last commit's
+  (different) feature logic.
+- **Why (vs. alternatives):**
+    - *Widen the git-hash approach to cover all three files (e.g. combine
+      three `git rev-list` calls) instead of switching to a content hash:*
+      rejected — doesn't fix the `.dockerignore`/`.git/` blind spot, which
+      is the second, independently-real bug the review flagged; a content
+      hash fixes both problems with one mechanism instead of two.
+- **Failure mode:** scoped to exactly these three files — a change to a
+  FOURTH file that also affects feature semantics (e.g. a shared `core/`
+  helper `dataset_builder_base.py` itself) would not move this hash. Named
+  explicitly in the function's own docstring as the boundary of what this
+  guarantees, not silently assumed to be exhaustive.
+- **Scaling story (10x/100x):** `hasher.update(path.read_bytes())` over
+  three files is O(file size), negligible next to the correlated self-joins
+  that already dominate `fetch_raw()`'s runtime — irrelevant at any row
+  count.
+- **Interview question this maps to:** "Your feature-pipeline-version check
+  had a blind spot — how did you find it and what did you replace it
+  with?" — the review named the blind spot; the fix is a content hash over
+  the actual set of files that define pipeline behavior, verified by a test
+  that would catch a regression to single-file scope.
+
+## Decision (review-driven, P2): structured JSON logging across the four batch entrypoints; a capsys-visibility bug found and fixed in the process
+
+- **What:** Added `core/logging_utils.py` (`JsonFormatter` +
+  `configure_json_logging()`, domain-agnostic per this project's core/ vs
+  domains/pharma/ split) and replaced every `print()` call in
+  `drift_job.py`, `register_model.py`, `retrain_trigger.py`, and
+  `dataset_builder.py` with `logger.info()`/`logger.warning()` calls
+  (`logger = logging.getLogger(__name__)`, one per module, per the fix
+  plan). `configure_json_logging()` is called at each module's import time
+  (not gated behind `if __name__ == "__main__":`) so the structured output
+  shows up whether the module is run as a CLI (`make drift`,
+  `make register-model`), imported by another script (`retrain_trigger.py`
+  imports `register_model.py`), or called from a notebook/test — and is
+  idempotent, so importing more than one of these four in the same process
+  never stacks duplicate handlers.
+- **`dataset_builder.py` is the one of the four that `api.py` also
+  imports (for `PharmaDatasetBuilder`/`CATEGORICAL_FEATURES`) — flagged,
+  not silently absorbed:** this means `configure_json_logging()` also runs
+  inside the live API process at startup, not just this module's own CLI
+  entrypoint. Judged a harmless, even positive, side effect: nothing
+  previously attached a handler to the root logger there at all (any
+  app-internal `logging.*` call was invisible beyond Python's WARNING+
+  "handler of last resort"), and `configure_json_logging()`'s idempotency
+  guard means multiple entrypoints importing it in one process is
+  explicitly a supported case, not an accident.
+- **Real bug found and fixed: `logging.StreamHandler(sys.stdout)` breaks
+  pytest's `capsys`.** `tests/test_version_mismatch.py`'s
+  `assert "WARNING" in captured.out` started failing the moment
+  `retrain_trigger.py`'s version-mismatch warning moved from `print()` to
+  `logger.warning()` — not because the message changed, but because
+  `logging.StreamHandler(sys.stdout)` captures whatever `sys.stdout` object
+  IS at handler-construction time (module import, long before `capsys`
+  monkeypatches `sys.stdout` for an individual test), and keeps writing to
+  that stale reference forever. The JSON output was genuinely being
+  produced (visible in pytest's own "Captured stdout call" section) but
+  invisible to `capsys.readouterr()`. Fixed with `_StdoutProxy` — a
+  stream-like object whose `write()`/`flush()` resolve `sys.stdout` at
+  CALL time via the module-level `sys` reference, so it observes capsys's
+  per-test swap correctly. Added
+  `tests/test_logging_utils.py::test_configured_logging_is_visible_to_capsys`
+  as a regression test for exactly this failure mode, plus tests for
+  formatter output shape and idempotency.
+- **Why (vs. alternatives):**
+    - *Gate `configure_json_logging()` behind each file's own
+      `if __name__ == "__main__":` block, to avoid touching the API
+      process's logging at all:* considered and rejected — `api.py` never
+      calls `dataset_builder.py`'s `build_features()`/`write_to_db()` (the
+      methods with the converted `logger.info()` calls), so the log lines
+      themselves never fire during serving either way; gating would also
+      mean `PharmaDatasetBuilder` called from a notebook or test gets NO
+      visible output at all (a real regression from the old `print()`
+      behavior), for no corresponding benefit.
+    - *Use `logging.StreamHandler()`'s default stderr instead of stdout:*
+      rejected — same staleness bug applies to `sys.stderr`, and stdout is
+      what the pre-existing `print()`-based tests and `make drift | jq`
+      shell-pipeline usage both expect.
+- **`/metrics` endpoint:** added via
+  `Instrumentator().instrument(app).expose(app)`
+  (`prometheus-fastapi-instrumentator`, added to the serving dependency
+  group). Verified with a live TestClient request (200, valid Prometheus
+  text format) and against the real docker-compose container (see M9-19
+  entry). Nothing scrapes it today — the same honest "the surface exists,
+  traffic doesn't" framing M9-7's `ml.prediction_log` entry already uses
+  for drift monitoring.
+- **Failure mode:** the JSON formatter's `msg` field is built from
+  `record.getMessage()`, which already interpolates `%`-style args — a
+  logging call with a malformed format string (e.g. mismatched `%s` count)
+  raises at log time same as it always would with stdlib logging; not a
+  new failure mode introduced by the JSON wrapping.
+- **Scaling story (10x/100x):** irrelevant to row/model scale — this is a
+  log-format and observability-surface fix. `/metrics`' request-count/
+  latency histograms are the one piece that DOES matter at real traffic
+  volume — they're what a Prometheus scrape target would consume for
+  alerting, which is exactly the "what would you monitor in production"
+  question this exists to have a real answer to.
+- **Interview question this maps to:** "How did you catch that your new
+  logging setup broke a test in a way that had nothing to do with the log
+  message content?" — `capsys` captured nothing, the message was still
+  correct, and the only way to find it was noticing the JSON payload
+  appeared in pytest's "Captured stdout call" diagnostic section but not in
+  the fixture's own return value — a stream-identity bug, not a
+  content bug.
+
+## Decision (review-driven, P2): served probabilities clipped to [0.001, 0.999]; plain-English never says "100%"/"0%"
+
+- **What:** `api.py`'s `_predict_from_row()` now clips
+  `proba = float(np.clip(proba_arr[0], 0.001, 0.999))` immediately after
+  reading the calibrated model's output — before the threshold decision,
+  SHAP summary, or response are built from it, so every downstream
+  consumer sees the clipped value, not just the JSON `proba` field.
+  `plain_english.py` gained `_format_probability()`: values that would
+  round to "100%"/"0%" under plain `f"{proba:.0%}"` formatting (>=0.995 /
+  <0.005) render as "at least 99%" / "less than 1%" instead; every other
+  value formats exactly as before. Both layers matter independently: the
+  clip bounds the served NUMBER, the formatter bounds what plain English
+  ever DISPLAYS even for an unclipped caller (defensive — `_format_probability`
+  doesn't assume its input was already clipped).
+- **Range note (flagged, not silently deviated from):** the M9 fix-plan
+  document (`M9_REVIEW_FIXES_PLAN.md`'s own §P2-18 text) specifies
+  `[0.01, 0.99]`; this session's actual task instructions specified
+  `[0.001, 0.999]` and were followed as the authoritative, more current ask
+  — the plan document was not updated to match. Recorded here so a future
+  reader diffing the plan against the code doesn't mistake this for an
+  unflagged deviation.
+- **Test coverage:** `tests/test_plain_english.py` gained 4 tests
+  (`_format_probability`'s normal/high-extreme/low-extreme behavior, plus
+  `generate_summary` never containing the literal strings "100%"/"0%").
+  `tests/test_api_contract.py` gained
+  `test_proba_is_clipped_to_avoid_100_or_0_percent`, which monkeypatches
+  the fixture bundle's `calibrated_model.predict_proba` to return genuine
+  `0.0`/`1.0` and asserts `_predict_from_row()`'s response clips to
+  `0.999`/`0.001` and the plain-English summary contains neither "100%"
+  nor "0%".
+- **Why (vs. alternatives):**
+    - *Only fix the display layer (plain_english.py), leave the served
+      `proba` JSON field unclipped:* rejected — a consumer reading the raw
+      `proba` field directly (RegIntel's `trial_risk` tool wrapper, a BI
+      dashboard) would still see literal `1.0`/`0.0`, which is exactly the
+      "100%/0% certainty" credibility problem the fix targets, just moved
+      one layer down.
+    - *Switch the calibrator to a monotone spline / beta calibration that
+      structurally can't saturate, instead of clipping:* the fix plan
+      itself names this as a possible future revisit — not pursued this
+      session; clipping is the 20-minute fix, a calibrator swap is a
+      modeling-methodology change that deserves its own evaluation (ECE,
+      TEST-split reliability curve) independent of this polish pass.
+- **Failure mode:** the clip bounds are hardcoded (`0.001`/`0.999`), not
+  derived from anything about this specific model's calibration curve — a
+  model whose real, well-calibrated extreme probabilities are much closer
+  to 0/1 than these bounds would have its output slightly compressed at the
+  tails. Judged acceptable: the entire point is that "compressed at the
+  tails" is exactly the honest thing to communicate, not a modeling error
+  to correct for.
+- **Scaling story (10x/100x):** `np.clip` on a scalar is O(1) — irrelevant
+  to row/model/request scale.
+- **Interview question this maps to:** "Would you ever tell a stakeholder a
+  trial has a 100% termination probability?" — no, and the API can no
+  longer produce that string even if the calibrator's raw output would
+  have implied it.
+
+## Decision (review-driven, P2): container hardening — non-root user, digest-pinned base image, HEALTHCHECK; verified against a real running container, not just a Dockerfile diff
+
+- **What:** `Dockerfile` changes, landed together with the M9-13 serving/dev
+  dependency split (same file, one coherent rewrite):
+    - **Non-root:** `RUN adduser --disabled-password --gecos "" appuser`;
+      `chown -R appuser:appuser /app` after `COPY . .`; `USER appuser`
+      before `CMD`.
+    - **Digest-pinned base image:** `FROM
+      python@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93`
+      (pulled and inspected live: `docker pull python:3.11-slim &&
+      docker inspect ... --format='{{index .RepoDigests 0}}'`), not the
+      floating `python:3.11-slim` tag.
+    - **HEALTHCHECK:** `--interval=30s --timeout=10s --start-period=60s
+      --retries=3 CMD curl -f http://localhost:8000/health || exit 1`
+      (`curl` added to the `apt-get install` alongside `libgomp1`).
+- **Verified end-to-end against a real running container, not just a
+  Dockerfile diff:** `docker compose up --build -d` against this
+  developer's real `.env`/`mlruns/` (docker-compose's existing
+  bind-mount setup, unchanged by this fix) — confirmed `docker exec ...
+  whoami` returns `appuser` (not root); `curl localhost:8000/health` and
+  `/metrics` both return 200 on the live container; a real
+  `POST /api/v1/predict` call returned a fully-correct response (proba,
+  clipped uncertainty_band, coverage_guarantee, partitioned SHAP,
+  plain-English summary, feature_pipeline_version — exercising M9-9, M9-15,
+  M9-16, M9-17, and M9-18 together in one live request); and, after waiting
+  past the 60s `start-period`, `docker inspect --format='{{.State.Health.Status}}'`
+  reported `healthy`. Torn down with `docker compose down` afterward.
+- **Why (vs. alternatives):**
+    - *`USER 1000:1000` (the fix plan's literal snippet) instead of
+      `adduser` + a named user:* used `adduser` instead — a named
+      `appuser` in `/etc/passwd` is what lets `docker exec ... whoami`
+      (and any tool that resolves a username, not just a bare UID) report
+      something meaningful; functionally equivalent for the non-root
+      requirement itself.
+    - *Skip the live-container verification and trust the Dockerfile
+      diff:* rejected — the whole point of a hardening change is that it
+      shouldn't silently break something (non-root permissions on the
+      bind-mounted `mlruns/`, the HEALTHCHECK's `curl` dependency); a
+      `docker build` that merely succeeds doesn't prove the container
+      actually serves a correct prediction as `appuser`.
+- **Failure mode:** the non-root `appuser` only has whatever permissions
+  the bind-mounted `mlruns/`/`config.yaml` volumes grant on the HOST side —
+  verified read access works (the live prediction above proves it), but a
+  host filesystem with more restrictive permissions than this developer's
+  machine could still break model loading; not something this fix can
+  guarantee across arbitrary host configurations.
+- **Trigger to reconsider the digest pin:** re-pull and update it if a
+  security patch to the base image is ever needed — a digest never
+  auto-updates, which is the safety property being bought, but means this
+  file needs a manual bump when `python:3.11-slim` itself gets patched.
+- **Scaling story (10x/100x):** irrelevant to row/model/request scale —
+  this is image supply-chain and process-privilege hardening, a one-time
+  property of the image, not something that degrades under load.
+- **Interview question this maps to:** "Walk me through your container's
+  security posture." — non-root process, digest-pinned base (no
+  floating-tag supply-chain surprise), and a real liveness probe that
+  reflects actual server health per `core/serving/api_base.py`'s own
+  `/health`-vs-`/ready` distinction — verified against a live container,
+  not asserted from a Dockerfile diff alone.
+
+## Decision (review-driven, P2): staying on MLflow's model-registry "stages" API despite the FutureWarning, with a named migration path and trigger
+
+- **What:** This codebase uses `stage="Production"`/`"Staging"`/`"Archived"`
+  throughout — `register_model.py`'s Production registration and
+  previous-version archival, `retrain_trigger.py`'s Staging registration,
+  `rollback.py`'s `rollback_production()`, `drift_job.py`'s/`api.py`'s
+  Production-version lookups via `get_latest_versions(...,
+  stages=["Production"])` — all of which emit
+  `mlflow.tracking.client.MlflowClient.transition_model_version_stage`/
+  `get_latest_versions` `FutureWarning`s under mlflow 2.22.5 ("Model
+  registry stages will be removed in a future major release"). Decision:
+  keep the stages API as-is for the remainder of this project's active
+  development, not migrate to the alias-based replacement now.
+- **Why this, not migrating now:**
+    - `pyproject.toml`'s `mlflow>=2.14,<3.0` ceiling (pre-existing, already
+      in place before M9) is the actual mitigation — stages remain
+      available and functional for this entire pin range; the warning is
+      forward-looking, not an imminent break. Nothing in mlflow 2.x's
+      roadmap removes stages; only "a future major release" (3.x) does.
+    - The migration itself is well-understood and small in scope, which is
+      exactly why it doesn't need to happen preemptively: replace
+      `stage="Production"` writes with
+      `client.set_registered_model_alias(name, "champion", version)` and
+      `stage="Production"` reads with
+      `mlflow.sklearn.load_model("models:/{name}@champion")` (or
+      `get_model_version_by_alias`). Every one of this codebase's stage
+      call sites is a thin, mechanical wrapper around exactly these two
+      operations (register/promote, and look-up-current-Production) — no
+      call site does anything stage-semantics-specific (no reliance on
+      "Staging" as a distinct queryable state beyond "the alias I haven't
+      promoted yet," which aliases support equally well via a second alias
+      like `"candidate"`). Estimated at roughly a day: rename the stage
+      arguments, re-verify M7's retrain/rollback tests
+      (`test_retrain_trigger.py`/`test_rollback.py`/
+      `test_version_mismatch.py`) against the alias API, no model retrain
+      or schema change required.
+    - Migrating now, before it's forced, would be effort spent on a
+      library-API-currency concern with zero user-facing or model-quality
+      benefit — directly the kind of proactive scope CLAUDE.md's "is this
+      implementation-forced, or is this scope creep?" standing question is
+      meant to catch. This one isn't implementation-forced: mlflow 2.22.5
+      works today, and will keep working for the `<3.0` pin's entire
+      range.
+- **Trigger to reconsider:** migrate when mlflow 3.x is actually released
+  AND this project needs to upgrade past it (e.g. a security fix, a new
+  MAPIE/sklearn compatibility requirement that only ships against mlflow
+  3.x). Until then, the `<3.0` ceiling is sufficient, and is documented as
+  such directly in `pyproject.toml`'s dependency comment (not just here).
+- **Failure mode:** if the `<3.0` ceiling is ever accidentally loosened
+  (e.g. a careless `uv add mlflow --upgrade` past the pin) without this
+  decision being revisited first, every stage-based call site above breaks
+  simultaneously at the next `register-model`/`check-drift-retrain`/
+  `rollback` run — a single dependency-version bump, not a code change,
+  would be the actual trigger for an otherwise-silent breakage. The pin is
+  the guardrail against exactly that.
+- **Scaling story (10x/100x):** irrelevant to row/model/request scale — a
+  library-API-lifecycle decision, not a performance or architecture one.
+- **Interview question this maps to:** "Your code uses a deprecated MLflow
+  API — why haven't you fixed it?" — because it isn't broken yet, the
+  `<3.0` pin is the documented reason it won't break under this project,
+  and the migration path (aliases, ~1 day, every call site already
+  identified) is ready to execute the moment mlflow 3.x is actually forced
+  on this project rather than being speculative work against a warning.
+
+## M9-21: doc drift cleanup sweep
+
+Presentation/documentation-hygiene items, per the fix plan's six-item list. Most
+are one-liners; two turned out to need more than a text replacement, noted below.
+
+- **`docs/error_analysis.md`:** checked for the stale "feature_pipeline_version=
+  unknown, no git commits yet" line the fix plan named — already gone (M9-1's
+  entry already notes this essay was "rewritten from scratch in M9"). No change
+  needed; confirmed rather than assumed clean.
+- **`notebooks/04_shap_analysis.ipynb`:** the markdown cell pointing to
+  `logs/query_log.md` "for the persisted copy" was fixed — `logs/` is gitignored
+  and never exists on a fresh checkout, so that pointer was a dead link for
+  anyone but the original author. Dropped the pointer, kept the actual query-log
+  entry (already reproduced inline in the same cell) as the sole copy.
+- **`notebooks/01_dataset_audit.ipynb` funnel — root cause was NOT the row
+  counts, it was a missing `ORDER BY`.** The fix plan described this as "fix the
+  non-monotonic funnel (`plausible_start_date` count above
+  `phase_2_3_and_label_status` count)" — investigated before treating it as a
+  simple stale-output re-run. The four-branch `UNION ALL` funnel query had no
+  `ORDER BY` at all; Postgres is free to return `UNION ALL` rows in any order,
+  and it did — two different re-executions of the identical query (once during
+  this fix, once again after adding a fix) returned two DIFFERENT scrambled row
+  orders, while the underlying counts were themselves always correct and
+  monotonically decreasing (596,690 → 114,618 → 79,478 → 78,260). Fixed the
+  actual cause: added a `stage_order` integer column to each branch and
+  `ORDER BY stage_order`, dropped before display. A stale re-run without this
+  fix would have "passed" by accident on some future re-execution and silently
+  regressed on the next — the query itself needed to change, not just its cached
+  output. Re-executed the full notebook via `nbconvert --execute --inplace`
+  (matching M9-1's addendum precedent: full re-execution, not manual cell
+  edits) — also caught and fixed a second, smaller drift found in the same pass:
+  the final markdown cell's "1,228 RECRUITING/ACTIVE_NOT_RECRUITING trials"
+  no longer matched the re-executed count (1,224); updated in the same commit
+  since it's adjacent content in the same notebook re-execution.
+- **`config.yaml` n=79,334 vs n=78,260 — reconciled the `missingness_policy`
+  block specifically, not every occurrence of "79,334" in the repo.** The
+  `missingness_policy` section's `null_rate_observed` comments were explicitly
+  labeled "measured against the Phase2/3 + label-eligible filtered set
+  (2026-07-30, n=79,334)" — a real, current-documentation claim about the
+  dataset's size that had gone stale across M9-1's enrollment_count removal and
+  M9-11's sponsor-history rebuild (current cache: n=78,260, per decisions.md
+  M9-11). Re-measured directly against `data/raw_trials_cache.parquet` (live
+  query, not a rescaled estimate) and updated all six `null_rate_observed`
+  values with real numbers. Two occurrences deliberately left untouched, not
+  silently missed:
+    - `config.yaml`'s own line 37 ("222 of 79,334 label-eligible rows... had
+      start_date < 1990-01-01") describes a DIFFERENT population — the
+      pre-start-date-filter row count at the time of the original M1
+      investigation, not the current post-all-filters dataset size the
+      missingness block describes. `_RAW_FEATURE_SQL`'s `WHERE start_date >=
+      start_date_min` clause means those 222 rows are excluded from the cache
+      at the SQL level and cannot be recounted from it — rewriting "79,334" to
+      "78,260" here would misrepresent what the number means, not fix a stale
+      figure.
+    - `docs/decision-log/M1-dataset-builder.md` also contains "79,334" — a
+      historical milestone decision-log entry, which this project's own
+      convention (see every M9-* entry: corrections are ADDED, not retroactive
+      edits to earlier milestones' entries) treats as a point-in-time record,
+      not live documentation to keep current.
+- **`.gitignore`:** `.DS_store` → `.DS_Store` (the wrong casing silently failed
+  to match on this case-sensitive filesystem). Verified with `git status
+  --porcelain --ignored`: the repo's actual `.DS_Store` file now shows as
+  ignored (`!!`), and was never accidentally tracked in git history in the
+  first place (checked via `git ls-files`).
+- **`core/conformal.py`'s `verify_coverage()`:** `passed = empirical >= 0.88`
+  (hardcoded) → `passed = empirical >= self.target_coverage - 0.02` (derived).
+  No behavior change at this project's actual `target_coverage=0.90`
+  (0.90 − 0.02 = 0.88 exactly) — the bug was latent, not yet triggered: a
+  future `MAPIEConformalWrapper(target_coverage=0.95)` would have silently kept
+  the old 0.88 floor, passing a run that under-covers its own 0.95 target by a
+  full 5pp instead of the intended 2pp tolerance. Added an over-coverage
+  warning (`empirical > target_coverage + 0.05` → new `over_covered` field in
+  the returned dict, plus a printed warning) — over-coverage isn't a failure,
+  but it does mean the conformal quantile is wider than it needs to be,
+  trading away interval informativeness for margin nobody asked for. Added
+  `tests/test_conformal.py` (4 tests, stubbed `self.mapie_.predict_set()`, no
+  real MAPIE fit needed): tolerance derives correctly at a non-default target
+  (would have passed incorrectly under the old hardcoded gate), the default
+  target's boundary still matches the old 0.88 behavior exactly, over-coverage
+  is flagged past the +5pp threshold, and not flagged within it.
+- **Why (vs. alternatives), scoped to the two items with a real design
+  choice:**
+    - *Blindly text-replace every "79,334" in the repo with "78,260":*
+      rejected — the M1-dataset-builder.md and config.yaml line-37 occurrences
+      describe different things than the missingness-policy block does;
+      correcting a genuinely stale documentation claim is different from
+      erasing a historical record or restating a different measurement
+      incorrectly.
+    - *Fix notebook 01's funnel by just re-running it once and accepting
+      whatever order came back:* rejected once the second re-execution proved
+      the order itself was non-deterministic — a fix that "happens to look
+      right" on one run is not a fix.
+- **Failure mode:** none of these six items has an ongoing failure mode beyond
+  what's already named per-item above (the `verify_coverage` scoping note, the
+  funnel's `ORDER BY` now being load-bearing for display correctness).
+- **Scaling story (10x/100x):** none of these six items are scale-sensitive —
+  documentation/display/tolerance-formula fixes, not data-volume-dependent
+  logic.
+- **Interview question this maps to:** "How do you keep documentation from
+  drifting out of sync with the code and data it describes?" — the honest
+  answer for this sweep is that half these items required actually re-querying
+  or re-executing something to get a true current number, not just editing
+  text to look consistent; the funnel bug in particular would have kept
+  silently misleading readers if "fixed" by re-running once and trusting
+  the output.
