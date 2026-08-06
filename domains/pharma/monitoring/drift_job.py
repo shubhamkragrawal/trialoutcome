@@ -33,6 +33,7 @@ Two modes for what "current batch" means, selected via --source:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from datetime import date, timedelta
 from pathlib import Path
@@ -41,8 +42,12 @@ import mlflow
 import pandas as pd
 from sqlalchemy import text
 
+from core.logging_utils import configure_json_logging
 from core.monitoring.drift_base import DriftMonitorBase, DriftResult
 from domains.pharma.dataset_builder import PharmaDatasetBuilder
+
+configure_json_logging()
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REGISTERED_MODEL_NAME = "trialoutcome_xgb_calibrated"
@@ -247,20 +252,25 @@ class PharmaDriftMonitor(DriftMonitorBase):
         reference = self.load_reference()
         current = self.load_current()
         if self.source == "training":
-            print(f"Reference (split={self.config['reference_split']}): {reference.shape}")
-            print(f"Current   (split={self.config['current_split']}):   {current.shape}")
+            logger.info("Reference (split=%s): %s", self.config["reference_split"], reference.shape)
+            logger.info("Current   (split=%s):   %s", self.config["current_split"], current.shape)
         else:
-            print(f"Reference (split={self.config['reference_split']}): {reference.shape}")
-            print(f"Current   (ml.prediction_log, last {self.lookback_days}d): {current.shape}")
+            logger.info("Reference (split=%s): %s", self.config["reference_split"], reference.shape)
+            logger.info(
+                "Current   (ml.prediction_log, last %sd): %s", self.lookback_days, current.shape
+            )
 
         common_cols = [c for c in reference.columns if c in current.columns]
         if current.empty or not common_cols:
-            print(
-                "[drift_job] --source=prediction_log has no comparable data yet "
-                f"({len(current)} rows logged in the last {self.lookback_days} days, "
-                f"{len(common_cols)} columns shared with the training reference) -- "
-                "this is the honest current state (no live traffic has been served "
-                "outside of local testing), not a bug. See this module's docstring."
+            logger.info(
+                "--source=prediction_log has no comparable data yet "
+                "(%d rows logged in the last %s days, %d columns shared with the "
+                "training reference) -- this is the honest current state (no live "
+                "traffic has been served outside of local testing), not a bug. "
+                "See this module's docstring.",
+                len(current),
+                self.lookback_days,
+                len(common_cols),
             )
             result = DriftResult(drifted=False, n_features_drifted=0, drift_share=0.0)
             report_path = REPO_ROOT / "reports" / f"drift_{date.today().isoformat()}.html"
@@ -280,7 +290,7 @@ class PharmaDriftMonitor(DriftMonitorBase):
             "drift_share": result.drift_share,
             "report_path": str(report_path),
         }
-        print(f"Drift summary: {summary}")
+        logger.info("Drift summary: %s", summary)
         return summary
 
 

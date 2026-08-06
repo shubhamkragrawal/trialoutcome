@@ -30,6 +30,7 @@ VERSION=N` is the actual one-command procedure, for both directions.
 from __future__ import annotations
 
 import argparse
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from xgboost import XGBClassifier
 
 from core.calibration import expected_calibration_error
 from core.dataset_builder_base import SplitDates
+from core.logging_utils import configure_json_logging
 from domains.pharma.dataset_builder import PharmaDatasetBuilder, feature_pipeline_version
 from domains.pharma.register_model import (
     EXPERIMENT_NAME,
@@ -59,6 +61,9 @@ from domains.pharma.train_pipeline import (
     _fit_condition_vocab,
     _make_preprocessor,
 )
+
+configure_json_logging()
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -273,18 +278,24 @@ def _version_mismatch_and_log(
         )
 
     if version_mismatch:
-        print(
-            f"WARNING: feature_pipeline_version mismatch -- candidate run {new_run_id} "
-            f"(version {new_version}) was trained with version="
-            f"{new_feature_pipeline_version!r}, but current Production (version "
-            f"{current_prod_version}) was trained with version={current_prod_fpv!r}. "
-            "Surfaced for human review only -- never auto-blocks or auto-proceeds "
-            "(drift is not a label-quality guarantee, and neither is a version match)."
+        logger.warning(
+            "feature_pipeline_version mismatch -- candidate run %s (version %s) was "
+            "trained with version=%r, but current Production (version %s) was trained "
+            "with version=%r. Surfaced for human review only -- never auto-blocks or "
+            "auto-proceeds (drift is not a label-quality guarantee, and neither is a "
+            "version match).",
+            new_run_id,
+            new_version,
+            new_feature_pipeline_version,
+            current_prod_version,
+            current_prod_fpv,
         )
 
-    print(
-        f"Staged for review: run_id={new_run_id}, version={new_version}. "
-        f"Promote with: make rollback VERSION={new_version}"
+    logger.info(
+        "Staged for review: run_id=%s, version=%s. Promote with: make rollback VERSION=%s",
+        new_run_id,
+        new_version,
+        new_version,
     )
     return version_mismatch
 
@@ -307,7 +318,7 @@ def check_and_trigger_retrain(force: bool = False) -> dict | None:
     latest_drift = _latest_drift_row(builder.engine)
     drifted = force or bool(latest_drift and latest_drift["drifted"])
     if not drifted:
-        print("No drift breach detected (and --force not set) -- nothing to do.")
+        logger.info("No drift breach detected (and --force not set) -- nothing to do.")
         return None
 
     new_run_id, new_version, new_fpv = _retrain_and_stage(builder)

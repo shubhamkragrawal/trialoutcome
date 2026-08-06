@@ -5,9 +5,10 @@ stays domain-agnostic. Run as `python -m domains.pharma.dataset_builder`.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import re
-import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -17,10 +18,51 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from core.dataset_builder_base import SplitDates, TemporalDatasetBuilder
+from core.logging_utils import configure_json_logging
+
+# M9-17: dataset_builder.py is the one of the four M9-17 modules that
+# domains/pharma/serving/api.py also imports (for PharmaDatasetBuilder and
+# CATEGORICAL_FEATURES) -- this call therefore also runs inside the API
+# process at startup, not just in this module's own CLI/`make build-dataset`
+# entrypoint. That's a deliberate, harmless side effect, not scope creep:
+# it means the API's own logging becomes structured too (previously nothing
+# attached a handler to the root logger there at all), and
+# configure_json_logging() is idempotent (see its docstring), so importing
+# this from multiple entrypoints in the same process never stacks handlers.
+configure_json_logging()
+logger = logging.getLogger(__name__)
 
 PACKAGE_DIR = Path(__file__).parent
 REPO_ROOT = PACKAGE_DIR.parent.parent
 CONFIG_PATH = PACKAGE_DIR / "config.yaml"
+
+# M9-13: lives here, not in train_pipeline.py, because domains/pharma/serving/api.py
+# needs these two lists (for _original_feature_of's SHAP aggregation) without
+# needing anything else train_pipeline.py imports. train_pipeline.py pulls in
+# optuna + lightgbm at module level for its Optuna sweep across four model
+# families -- neither is a serving-time dependency, but api.py used to import
+# CATEGORICAL_FEATURES straight from train_pipeline.py, which meant importing
+# api.py silently ran `import optuna` and `from lightgbm import LGBMClassifier`
+# too (Dockerfile's libgomp1 comment already flagged the lightgbm half of this
+# as a known wart). train_pipeline.py now imports these back from here, so
+# there is still exactly one definition, and the servable import graph no
+# longer pulls in either training-only package. See
+# docs/decision-log/M9-review-fixes.md M9-13.
+CATEGORICAL_FEATURES = ["phase", "allocation", "masking", "has_dmc_str", "sponsor_class"]
+NUMERIC_FEATURES = [
+    # M9-1: log_enrollment_count / enrollment_missing removed as target
+    # leakage. See config.yaml dropped_features and decisions.md M9-1.
+    "num_primary_outcomes",
+    "num_sites",
+    "has_results",
+    "eligibility_criteria_length",
+    "exclusion_keyword_count",
+    "sponsor_prior_trial_count",
+    "sponsor_prior_termination_rate",
+    "condition_rarity",
+    "start_year",
+    "start_quarter",
+]
 
 # --- The single feature-fetch query. All joins, tie-breaks, and point-in-time
 # self-joins live in this string per "no raw SQL in core/". -----------------
@@ -183,37 +225,56 @@ def _get_engine(config: dict) -> Engine:
     return create_engine(url)
 
 
+# M9-16: every file that defines the feature pipeline -- what
+# feature_pipeline_version() hashes below. Deliberately NOT just this file:
+# see that function's docstring for the two blind spots a single-file git
+# hash had.
+_PIPELINE_FILES = (
+    PACKAGE_DIR / "dataset_builder.py",
+    PACKAGE_DIR / "train_pipeline.py",
+    PACKAGE_DIR / "config.yaml",
+)
+
+
 def feature_pipeline_version() -> str:
     """
-    Purpose: Return the git commit hash of this file at call time, logged as
-        an MLflow tag on every training run (M2+).
+    Purpose: Return a content hash covering every file that defines the
+        feature pipeline, logged as an MLflow tag on every training run
+        (M2+) and compared by M7's promotion-time version-mismatch check.
+
+    M9-16 WIDENED (was `git rev-list -1 HEAD -- dataset_builder.py` alone,
+        this file's previous single-file git hash): the review (§2.9) flagged
+        two blind spots. (1) Single-file scope: a change to
+        train_pipeline.py's CATEGORICAL_FEATURES/NUMERIC_FEATURES or
+        config.yaml's missingness policy / dropped_features / split dates
+        moved neither the old hash nor M7's version-mismatch check, even
+        though both files define real pipeline behavior just as much as this
+        one does. (2) `.dockerignore` excludes `.git/`, so `git rev-list`
+        silently returned "unknown" for every run trained inside a
+        container -- masked by the "unknown" fallback the same way the
+        pre-M5 rev-parse bug was (see the M5 NOTE this replaced). A sha256
+        content hash of the three files' concatenated bytes fixes both: it
+        moves whenever any of the three actually-defining files change, and
+        it needs nothing from `.git/` to compute.
     Leakage guard: N/A.
     Failure mode: If this is wrong or stale, a promotion-time version-mismatch
         check (M7) cannot detect that a candidate model was trained on
         different feature logic than the current Production model -- a real
-        silent-feature-drift incident waiting to happen.
+        silent-feature-drift incident waiting to happen. M9-16 note: unlike
+        the old git hash (which only moved on commit), this ALSO changes on
+        uncommitted edits to any of the three files -- deliberate, not a bug:
+        a training run against dirty working-tree state should be tagged as
+        such, not silently attributed to the last commit's (different)
+        feature logic. Scoped to exactly these three files -- a change to a
+        FOURTH file that also affects feature semantics (e.g. a shared
+        core/ helper) would not move this hash; see this function's own test
+        (tests/test_feature_pipeline_version.py) for the property this
+        actually guarantees.
     """
-    try:
-        # NOTE (M5 bugfix): `git rev-parse HEAD -- <path>` does NOT filter by
-        # path -- rev-parse's job is argument disambiguation, so it just
-        # echoes the path back as a second/third output line ("HEAD's hash",
-        # "--", "<path>") rather than restricting the hash to the last commit
-        # that touched <path>. That polluted every tag this function set with
-        # trailing "--\n<path>" garbage the moment the repo had a real commit
-        # (silent while the repo had zero commits, since the fallback
-        # "unknown" masked it). `git rev-list -1 HEAD -- <path>` is the
-        # correct incantation for "the hash of the last commit touching this
-        # path".
-        result = subprocess.run(
-            ["git", "rev-list", "-1", "HEAD", "--", str(Path(__file__).relative_to(REPO_ROOT))],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip() or "no-commits-yet"
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
+    hasher = hashlib.sha256()
+    for path in _PIPELINE_FILES:
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
 
 
 class PharmaDatasetBuilder(TemporalDatasetBuilder):
@@ -298,7 +359,7 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         n = len(df)
         policy = self.config["missingness_policy"]
 
-        print(f"[build_features] {n} rows after filters. Null rates:")
+        logger.info("build_features: %d rows after filters. Null rates:", n)
         for col in [
             "enrollment_count",
             "num_primary_outcomes",
@@ -312,7 +373,7 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
             "sponsor_prior_termination_rate",
         ]:
             rate = df[col].isna().mean()
-            print(f"  {col}: {rate:.4f}")
+            logger.info("  %s: %.4f", col, rate)
 
         # phase NULL -> drop row (already excluded by fetch_raw's WHERE clause,
         # re-asserted here so build_features is safe to call standalone).
@@ -473,10 +534,10 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
         split_df = self.temporal_split(feat, date_col="start_date", split_dates=dates)
         split_df, one_hot_cols = self._one_hot_condition(split_df)
 
-        print("Split counts:\n", split_df["split"].value_counts())
-        print(
-            "Class balance overall: "
-            f"{split_df['label'].mean():.4f} positive (is_terminated-equivalent)"
+        logger.info("Split counts:\n%s", split_df["split"].value_counts())
+        logger.info(
+            "Class balance overall: %.4f positive (is_terminated-equivalent)",
+            split_df["label"].mean(),
         )
 
         feature_cols = self.feature_columns(one_hot_cols)
@@ -490,7 +551,7 @@ class PharmaDatasetBuilder(TemporalDatasetBuilder):
             label_col="label",
             split_col="split",
         )
-        print(f"Wrote {n_written} rows to ml.training_dataset.")
+        logger.info("Wrote %d rows to ml.training_dataset.", n_written)
         return split_df
 
 
